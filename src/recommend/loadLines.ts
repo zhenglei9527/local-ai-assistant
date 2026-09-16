@@ -6,7 +6,7 @@
  * scoring rules remain testable in isolation.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 import {
   recommendModel,
@@ -35,16 +35,44 @@ export interface LoadedLines {
 
 export interface LoadLinesOptions {
   officialPath: string;
-  abliteratedPath: string;
+  /**
+   * Path to the uncensored catalogue — optional.
+   *
+   * That file is deliberately NOT published (it lists uncensored model
+   * repositories, a liability to tie to a public identity). Callers that point
+   * at a missing path get an empty line instead of a thrown ENOENT, which is
+   * what broke CI: the test suite runs against a checkout that legitimately does
+   * not contain the data.
+   *
+   * Absence here is a supported state, not an error — the `store` build flavour
+   * compiles the line out entirely anyway.
+   */
+  abliteratedPath?: string;
 }
 
 export function loadLines(opts: LoadLinesOptions): LoadedLines {
   const officialRaw = JSON.parse(
     readFileSync(opts.officialPath, 'utf8'),
   ) as OfficialCatalog;
-  const abliteratedRaw = JSON.parse(
-    readFileSync(opts.abliteratedPath, 'utf8'),
-  ) as Parameters<typeof toLineEntries>[0];
+
+  /**
+   * Best-effort read of the uncensored catalogue.
+   *
+   * A missing file yields an empty array rather than propagating ENOENT: the
+   * published repository does not ship this data, so failing here would mean
+   * nobody could run the tests after cloning — which is exactly what happened
+   * in CI before this guard.
+   *
+   * A *malformed* file still throws, and that is intentional: a present-but-
+   * corrupt catalogue is a real problem worth surfacing, whereas an absent one
+   * is a configuration choice.
+   */
+  let abliteratedRaw: Parameters<typeof toLineEntries>[0] = [];
+  if (opts.abliteratedPath && existsSync(opts.abliteratedPath)) {
+    abliteratedRaw = JSON.parse(
+      readFileSync(opts.abliteratedPath, 'utf8'),
+    ) as Parameters<typeof toLineEntries>[0];
+  }
 
   const official = tagOfficial(officialRaw.models);
   const abliterated = toLineEntries(abliteratedRaw);
