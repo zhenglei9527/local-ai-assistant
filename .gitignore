@@ -45,16 +45,18 @@ data/_*.ps1
 # consistent.
 data/models-jailbreak.json
 
-# The GENERATED module projected from that JSON. It is gitignored for the same
-# reason, and the published tree instead carries an empty version produced by
-# `node scripts/embed-abliterated.mjs --empty`.
+# NOTE: src/data/models/abliterated.generated.ts is deliberately NOT
+# ignored — it must be committed. lineCatalog.ts imports it statically,
+# and a missing module is an uncatchable link-time error. Gitignoring it
+# broke CI twice: the file simply did not exist on the runner.
 #
-# Why bother with a generated module at all: `lineCatalog.ts` needs this data at
-# LINK time, and a static import of a missing file is an uncatchable error. The
-# first CI run failed on exactly that — a fresh clone could neither build nor run
-# a single test. The module always exists, so absence is a legitimate empty
-# state rather than a broken build.
-src/data/models/abliterated.generated.ts
+# The committed copy holds an EMPTY array (the publishable state). A
+# working copy can fill it in and hide the local change with:
+#   git update-index --skip-worktree src/data/models/abliterated.generated.ts
+#
+# --skip-worktree (not --assume-unchanged) is correct here: it survives a
+# pull, whereas assume-unchanged is reset by any checkout.
+
 
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
