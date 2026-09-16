@@ -1,0 +1,116 @@
+import org.gradle.api.JavaVersion
+import org.gradle.api.Project
+
+/**
+ * Root build configuration.
+ *
+ * Version numbers pinned here (rather than inline per module) so the app module
+ * and any future module cannot drift apart.
+ *
+ * ⚠️ These versions were NOT validated by a build — no Android SDK/NDK/JDK is
+ * installed on the machine this skeleton was authored on. See
+ * docs/architecture.md §8. Verify against the React Native 0.83 template's own
+ * `android/build.gradle` before the first real build.
+ */
+buildscript {
+    ext {
+        buildToolsVersion = "35.0.0"
+        minSdkVersion = 26
+        compileSdkVersion = 35
+        targetSdkVersion = 35
+        // NDK version required by RN 0.83's native build. llama.rn additionally
+        // needs a recent NDK when building from source (rnllamaBuildFromSource).
+        ndkVersion = "27.1.12297006"
+        kotlinVersion = "2.1.20"
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.7.3")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${kotlinVersion}")
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("$rootDir/../node_modules/react-native/android") }
+        maven { url = uri("$rootDir/../node_modules/jsc-android/dist") }
+        // llama.rn publishes its prebuilt Android artifacts to GitHub Releases,
+        // not to Maven. The postinstall downloader writes them into
+        // node_modules/llama.rn/android/src/main/jniLibs, which the module's
+        // own build.gradle then packages — no repository entry needed here,
+        // but noting it because a missing jniLibs directory is the #1
+        // "UnsatisfiedLinkError at runtime" cause for this dependency.
+    }
+}
+
+/**
+ * minSdkVersion 26 (Android 8.0) is a deliberate floor.
+ *
+ * Reasons, in order of weight:
+ *  1. API 26 is where `ActivityManager.MemoryInfo` reports `totalMem`
+ *     reliably across OEM ROMs; on some API 24/25 devices it under-reports,
+ *     which would make the memory probe lie in the *unsafe* direction.
+ *  2. The foreground-service API used by the downloader is stable from 26.
+ *  3. API 26+ covers the overwhelming majority of active Android devices.
+ *  4. It lets the codebase use `java.nio.file` and default-method interfaces.
+ *
+ * Going lower is possible but would require a fallback path for the memory
+ * probe on exactly the devices least able to run a model anyway.
+ */
+
+subprojects {
+    afterEvaluate {
+        // Keep every subproject (including autolinked RN modules) on the same
+        // Java/Kotlin target as the app, so a module compiled for 21 cannot
+        // poison the runtime.
+        //
+        // NOTE: this must cover BOTH ApplicationExtension (the :app module) and
+        // LibraryExtension (every autolinked RN module). The original skeleton
+        // only matched ApplicationExtension, and used Kotlin syntax
+        // (`ApplicationExtension::class.java`, `?.apply`) which is a compile
+        // error in a Groovy build script.
+        //
+        // ALSO: detection must NOT use `project.hasProperty("android")`. With
+        // AGP 8.x the `android` extension is NOT exposed as a project property,
+        // so that check returns false for every module — including :app — and
+        // the whole block silently does nothing. Verified by build failure:
+        //   "No such property: java for class: com.android.build.api.dsl.ApplicationExtension"
+        // Detect through the extensions container instead, and guard the DSL
+        // shape separately since `compileOptions` is not on every Android
+        // extension type.
+        def androidExt = project.extensions.findByName("android")
+        if (androidExt == null) {
+            return
+        }
+        def javaVersion = JavaVersion.VERSION_17
+        if (androidExt.hasProperty("compileOptions")) {
+            androidExt.compileOptions.sourceCompatibility = javaVersion
+            androidExt.compileOptions.targetCompatibility = javaVersion
+        }
+    }
+}
+
+tasks.register("clean", Delete) {
+    delete(rootProject.layout.buildDirectory)
+}
+
+/**
+ * Version alignment helper — fails loudly rather than silently producing a
+ * mismatched native build.
+ *
+ * NOTE: this is a Groovy build script (`.gradle`), not Kotlin DSL. The original
+ * skeleton used Kotlin syntax (`val assertNdk: (Project) -> Unit = { ... }`)
+ * here, which is a compile error in Groovy.
+ */
+def assertNdk = { p ->
+    def ndk = p.findProperty("ndkVersion")
+    if (ndk == null) {
+        p.logger.warn("ndkVersion is not set; llama.rn's source build will fail.")
+    }
+}

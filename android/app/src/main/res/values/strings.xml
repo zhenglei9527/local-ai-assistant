@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      ⚠️ This value is OVERRIDDEN at build time by `resValue` in
+      android/app/build.gradle, which sets it per flavour
+      (标准版 → "本地AI助手", 完整版 → "本地AI助手 完整版").
+
+      It is kept here as a working default so the app still has a sane label if
+      the gradle override is ever removed.
+
+      DO NOT use a `${...}` manifest placeholder here. `manifestPlaceholders`
+      substitutes into AndroidManifest.xml ONLY — a placeholder inside
+      strings.xml is never resolved and ships as the literal text "${appLabel}",
+      which is what appeared in the launcher and in `aapt2 dump badging`.
+    -->
+    <string name="app_name">本地AI助手</string>
+</resources>

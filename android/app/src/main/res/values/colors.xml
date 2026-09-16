@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Minimal palette backing AppTheme. Referenced by styles.xml; creating it here
+  keeps the theme from depending on AppCompat's internal palette names, which
+  are not part of the public API.
+-->
+<resources>
+    <!-- Near-black, matching the app's own dark surface. -->
+    <color name="appBackground">#FF121212</color>
+    <!-- Live in the adaptive-icon layers too, so the launcher tile matches. -->
+    <color name="icLauncherBackground">#FF1F6FEB</color>
+</resources>

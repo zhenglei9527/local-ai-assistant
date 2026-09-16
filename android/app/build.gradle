@@ -1,0 +1,275 @@
+apply plugin: "com.android.application"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+/**
+ * React Native Gradle configuration.
+ *
+ * The `react { }` block below is what wires up the JS bundling task and the
+ * autolinking of native modules (llama.rn, op-sqlite, background-downloader).
+ * Without it the build succeeds but ships no JS bundle.
+ */
+react {
+    // Standard RN template layout — the JS entry is at the project root.
+    root = file("../../")
+    reactNativeDir = file("../../node_modules/react-native")
+    codegenDir = file("../../node_modules/@react-native/codegen")
+    cliFile = file("../../node_modules/react-native/cli.js")
+
+    // Hermes: the default and the right choice here. The engine's hot path is
+    // token streaming over the JSI bridge; Hermes' lower memory overhead and
+    // faster startup matter far more than any JIT advantage on this workload.
+    hermesEnabled = true
+
+    // Autolinking is what finds llama.rn's Android project. Do not disable.
+    autolinkLibrariesWithApp()
+}
+
+/**
+ * Signing config.
+ *
+ * Release signing reads from `~/.gradle/gradle.properties`. The debug config
+ * uses the RN template keystore, which is committed to the repo on purpose —
+ * it is public and only ever signs debug builds.
+ */
+def enableProguardInReleaseBuilds = true
+
+/**
+ * Build flavour: which model lines this binary carries.
+ *
+ *   APP_FLAVOR=store (default)  official line only — submittable to app stores
+ *   APP_FLAVOR=full             both lines — self-distribution only
+ *
+ * The value is threaded to Metro as a process env var so the JS side folds
+ * `INCLUDES_ABLITERATED` and drops the abliterated catalogue from the bundle
+ * entirely (see src/config/buildFlavor.ts). It is ALSO stamped into
+ * BuildConfig and the versionName, so an installed APK can be identified
+ * without launching it — which matters the moment two builds are in the wild.
+ *
+ * Fails closed: anything other than exactly "full" means store.
+ */
+def appFlavor = (System.getenv("APP_FLAVOR") ?: "store") == "full" ? "full" : "store"
+def isFullFlavor = appFlavor == "full"
+
+// Metro reads APP_FLAVOR from the environment of the Gradle daemon. Setting it
+// on the project env block propagates to the :app:bundleReleaseJsAndAssets
+// task, which spawns the bundler.
+project.ext.appFlavor = appFlavor
+
+android {
+    namespace "com.phonellm.app"
+    compileSdk rootProject.ext.compileSdkVersion
+
+    /**
+     * Give the built APK a human-readable filename.
+     *
+     * The default is `app-<buildType>.apk`, which is useless once the file
+     * leaves the build directory — a folder of `app-standalone.apk` copies is
+     * impossible to tell apart, and the user has to rename it by hand before
+     * sending it to a phone. Encoding name + version + flavour means the file
+     * identifies itself.
+     */
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            def flavour = isFullFlavor ? "完整版" : "标准版"
+            outputFileName = "本地AI助手-${flavour}-${variant.versionName}.apk"
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.phonellm.app"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode isFullFlavor ? 2 : 1
+        // Suffix makes the two builds distinguishable in Settings → Apps and
+        // impossible to confuse when both are installed on a test device.
+        versionName isFullFlavor ? "0.1.0-full" : "0.1.0"
+
+        buildConfigField "String", "APP_FLAVOR", "\"${appFlavor}\""
+        buildConfigField "boolean", "INCLUDES_ABLITERATED", "${isFullFlavor}"
+
+        /**
+         * Launcher label, set as a STRING RESOURCE — not a manifest placeholder.
+         *
+         * The previous revision used `manifestPlaceholders = [appLabel: ...]`
+         * together with `<string name="app_name">${appLabel}</string>`. That does
+         * not work: `manifestPlaceholders` substitutes into AndroidManifest.xml
+         * ONLY. Placeholders inside res/values XML are never resolved, so the
+         * APK shipped with the literal text "${appLabel}" as the launcher name —
+         * visible in `aapt2 dump badging` as `application-label:'${appLabel}'`
+         * and on the device home screen.
+         *
+         * `resValue` writes a real generated string resource, which the manifest
+         * then references via @string/app_name as usual.
+         */
+        resValue "string", "app_name", isFullFlavor ? "本地AI助手 完整版" : "本地AI助手"
+
+        /**
+         * arm64-v8a ONLY.
+         *
+         * This is the single most important line in the build for this app.
+         * llama.rn ships per-ABI native libraries and the llama.cpp .so set is
+         * roughly 15-40 MB PER ABI. Including armeabi-v7a/x86/x86_64 would
+         * multiply the APK size for targets that cannot realistically run a
+         * multi-billion-parameter model anyway.
+         *
+         * Every 64-bit Android device since ~2017 is arm64-v8a. armeabi-v7a
+         * devices are 32-bit, cannot address enough RAM for a useful model,
+         * and are excluded deliberately.
+         *
+         * x86_64 is omitted too: emulator-only, and the emulator cannot
+         * exercise GPU/NPU paths so it would be a false sense of coverage.
+         */
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    signingConfigs {
+        debug {
+            storeFile file("debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            // Phase 6: wire a real signing config before any Play upload.
+            // signingConfig signingConfigs.release
+            minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources enableProguardInReleaseBuilds
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+        /**
+         * Standalone sideload build: debug-signed (so it installs without a
+         * keystore) but with the JS bundle EMBEDDED in the APK.
+         *
+         * WHY THIS EXISTS
+         * ---------------
+         * A plain `assembleDebug` APK contains NO JavaScript and expects a
+         * Metro dev server on localhost:8081. Sideloaded onto a real phone it
+         * installs fine, launches, and then dies with
+         * "Unable to load script. Make sure you're running Metro..." — a
+         * confusing failure, because the build reported success and the APK is
+         * otherwise complete.
+         *
+         * `release` would also embed the bundle, but it additionally enables
+         * R8/ProGuard (`minifyEnabled true`) and has no signing config wired,
+         * so it neither installs nor is safe to ship untested.
+         *
+         * This type takes the debug path (debug signing, no minification) and
+         * flips on bundling. Use it for every on-device test until a real
+         * release keystore exists.
+         */
+        standalone {
+            initWith debug
+            matchingFallbacks = ["debug"]
+            signingConfig signingConfigs.debug
+            debuggable true
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    packagingOptions {
+        // Prebuilt llama.cpp .so files should not be stripped/recompressed;
+        // recompression breaks the mmap alignment some backends rely on.
+        jniLibs {
+            useLegacyPackaging = false
+            keepDebugSymbols += ["**/libllama.so", "**/librnllama.so"]
+        }
+        resources {
+            excludes += ["META-INF/{AL2.0,LGPL2.1}", "META-INF/DEPENDENCIES"]
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    /**
+     * Kotlin/JVM target 17. Required by RN 0.83's AGP and by the Kotlin
+     * version bundled with it. Raising this to 21 is a known trap on this RN
+     * line — the codegen output is compiled against 17.
+     */
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+/**
+ * Force APP_FLAVOR into the environment of the JS bundling task.
+ *
+ * WHY THIS BLOCK IS REQUIRED
+ *
+ * `src/config/buildFlavor.ts` reads `process.env.APP_FLAVOR`. Metro evaluates
+ * and inlines that expression while bundling, but only if the variable is
+ * actually present in the bundler's environment. The Gradle daemon's env is
+ * NOT automatically inherited by the Node process the RN plugin spawns, so
+ * without this the bundle always sees `undefined` → fails closed to `store` →
+ * a `full` build would ship WITHOUT the abliterated line and fail open in the
+ * confusing direction (feature silently missing) rather than the safe one.
+ *
+ * The assignment is guarded to run only on bundling tasks to avoid mutating
+ * the environment of unrelated tasks (notably the Kotlin/Java compilers, which
+ * are sensitive to env changes and would otherwise be forced to rebuild).
+ *
+ * ⚠️ `task.environment(...)` does NOT work here. The RN bundling tasks
+ * (`BundleHermesCTask` / `BundleJsAndAssetsTask`) are not `Exec` tasks and do
+ * not implement `ProcessForkOptions`, so calling `environment()` on them fails
+ * with:
+ *   "Could not find method environment() for arguments [APP_FLAVOR, store]"
+ * The supported seam is the `environment` *property* the RN Gradle plugin
+ * exposes on the task, which is what the plugin passes to the Node subprocess.
+ */
+tasks.configureEach { task ->
+    if (task.name.toLowerCase().contains("bundle") && task.name.toLowerCase().contains("jsandassets")) {
+        task.doFirst {
+            // `extra`/`environment` on the RN bundle task; guard for the
+            // property so a future RN version that renames it degrades to a
+            // warning instead of breaking the whole build.
+            if (task.hasProperty("environment")) {
+                def envMap = task.property("environment")
+                if (envMap instanceof Map) {
+                    envMap.put("APP_FLAVOR", appFlavor)
+                } else {
+                    task.environment = ["APP_FLAVOR": appFlavor]
+                }
+            } else {
+                logger.warn(
+                    "[phone-llm-app] Bundling task ${task.name} exposes no `environment`; " +
+                    "APP_FLAVOR will default to 'store' in the bundle."
+                )
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+    implementation("com.facebook.react:hermes-android")
+    // Pulls in every autolinked native module: llama.rn (inference +
+    // prebuilt .so), @op-engineering/op-sqlite (SQLite), and
+    // @kesha-antonov/react-native-background-downloader (download service).
+    if (hermesEnabled.toBoolean()) {
+        implementation("com.facebook.react:hermes-android")
+    } else {
+        implementation jscFlavor
+    }
+
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    // Coroutines for the native module's async memory/disk probing.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}

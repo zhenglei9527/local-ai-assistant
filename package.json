@@ -1,0 +1,61 @@
+{
+  "name": "phone-llm-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local GGUF LLM chat app for Android with a SillyTavern-style character card engine.",
+  "scripts": {
+    "android": "react-native run-android",
+    "start": "react-native start",
+    "pods": "cd ios && pod install",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import ./scripts/register-alias.mjs --test \"src/**/*.test.ts\"",
+    "test:wiring": "node --import ./scripts/register-alias.mjs --test src/store/engineWiring.test.ts",
+    "test:recommend": "node --test src/recommend/recommend.test.ts",
+    "test:lines": "node --test src/recommend/lines.test.ts",
+    "test:catalog": "node --test src/data/models/lineCatalog.test.ts",
+    "test:cards": "node --test src/character-card/parseCard.test.ts",
+    "test:native": "node --test src/specs/phoneLlmSystem.test.ts",
+    "test:inference": "node --test src/inference/contextWindow.test.ts src/inference/activationFreeze.test.ts src/inference/prefixStability.test.ts src/inference/rollingSummary.test.ts",
+    "test:onboarding": "node --test src/ui/onboarding/onboarding.test.ts",
+    "syntax:check": "node scripts/syntax-check.mjs"
+  },
+  "dependencies": {
+    "@kesha-antonov/react-native-background-downloader": "^4.6.3",
+    "@op-engineering/op-sqlite": "^15.2.9",
+    "@react-native-documents/picker": "^12.0.2",
+    "llama.rn": "0.13.0-rc.3",
+    "react": "19.2.0",
+    "react-native": "0.83.1",
+    "react-native-safe-area-context": "^5.6.0",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.0",
+    "@babel/preset-env": "^7.25.0",
+    "@babel/runtime": "^7.25.0",
+    "@react-native-community/cli": "^20.2.0",
+    "@react-native-community/cli-platform-android": "^20.2.0",
+    "@react-native/babel-preset": "0.83.1",
+    "@react-native/eslint-config": "0.83.1",
+    "@react-native/metro-config": "0.83.1",
+    "@react-native/typescript-config": "0.83.1",
+    "@types/jest": "^29.5.0",
+    "@types/react": "^19.2.0",
+    "babel-plugin-module-resolver": "^5.0.3",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=20.19.4"
+  },
+  "codegenConfig": {
+    "name": "PhoneLlmAppSpec",
+    "type": "modules",
+    "jsSrcsDir": "src/specs",
+    "android": {
+      "javaPackageName": "com.phonellm.app"
+    }
+  },
+  "packageManager": "pnpm@10.0.0",
+  "type": "module"
+}

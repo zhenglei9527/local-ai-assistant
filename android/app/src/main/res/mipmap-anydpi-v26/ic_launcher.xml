@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive launcher icon. minSdkVersion is 26, which is exactly the API level
+  that introduced adaptive icons, so this directory alone is sufficient — no
+  legacy per-density PNG fallbacks are required and none are shipped.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/icLauncherBackground" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

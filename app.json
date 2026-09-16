@@ -1,0 +1,7 @@
+{
+  "name": "phone-llm-app",
+  "displayName": "本地AI助手",
+  "android": {
+    "package": "com.phonellm.app"
+  }
+}

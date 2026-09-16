@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AppTheme — referenced by AndroidManifest.xml on both <application> and
+  <activity>. The AndroidManifest was authored referencing this style but the
+  resource was never created, so AAPT failed with
+  "resource style/AppTheme not found".
+
+  DayNight is deliberate: the app is a long-session reading/generation UI and
+  forcing light would be hostile at night. ColorPrimary comes from the RN
+  template's palette. `windowBackground` is set explicitly rather than left to
+  the platform so there is no white flash on cold start before React mounts.
+-->
+<resources>
+    <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/appBackground</item>
+        <item name="android:statusBarColor">@color/appBackground</item>
+        <item name="android:navigationBarColor">@color/appBackground</item>
+    </style>
+</resources>

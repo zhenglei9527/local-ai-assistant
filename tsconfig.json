@@ -1,0 +1,36 @@
+{
+  "extends": "@react-native/typescript-config/tsconfig.json",
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "lib": ["es2022"],
+    "jsx": "react-jsx",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+    "types": ["jest"],
+    // Required by src/character-card/* and src/recommend/*, which use explicit
+    // `.ts` / `.tsx` suffixes in their relative imports (e.g. `./worldInfo.ts`).
+    // Metro resolves those fine, but TypeScript rejects them without this flag.
+    // Safe here only because `noEmit` is set — the flag is illegal alongside
+    // emit, since a compiler that rewrites paths cannot keep `.ts` specifiers.
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "App.tsx", "index.js"],
+  "exclude": ["node_modules", "android", "ios"]
+}

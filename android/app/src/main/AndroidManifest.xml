@@ -1,0 +1,139 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      Model downloads only. INTERNET is the sole dangerous permission the app
+      requests, and no runtime prompt is needed for it.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      FOREGROUND_SERVICE + FOREGROUND_SERVICE_DATA_SYNC: required from API 34
+      for the downloader to keep running while the app is backgrounded, and
+      required from API 28 to start such a service at all.
+
+      We deliberately do NOT declare POST_NOTIFICATIONS. A multi-GB download
+      started by the user is not a surprise, and asking for notification
+      permission at launch is a measurable uninstall driver. The foreground
+      service still runs; only its notification is hidden on API 33+ if the
+      user never granted the permission. Roadmap Phase 2 revisits this with an
+      in-context prompt at download time.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+        tools:targetApi="34" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      NOTE: <uses-native-library> is NOT legal as a direct child of <manifest>
+      for an *application* module — AAPT2 fails resource linking with:
+        "AAPT: error: unexpected element <uses-native-library> found in <manifest>"
+      A `tools:node="remove"` marker does NOT help: the element is rejected
+      during manifest parsing, before the merger ever applies node rules.
+
+      The correct placement is inside <application>, which is where both
+      declarations now live (see below). This preserves the optional
+      native-library metadata instead of discarding it.
+    -->
+
+    <!--
+      largeHeap: this is NOT a fix for model memory.
+
+      llama.cpp weights are native allocations and are not charged against the
+      Java heap, so largeHeap does nothing for them. It is declared only to
+      give the JSI bridge headroom for the token-streaming objects, which are
+      genuinely long-lived and can otherwise push a 256 MB heap device into
+      GC thrash during a long generation.
+    -->
+    <application
+        android:name=".MainApplication"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:allowBackup="false"
+        android:largeHeap="true"
+        android:supportsRtl="true"
+        android:extractNativeLibs="true"
+        android:theme="@style/AppTheme"
+        tools:targetApi="34">
+
+        <!--
+          allowBackup="false" is deliberate and security-relevant: the app
+          directory holds multi-GB GGUF files (no backup needed) and the SQLite
+          database holds the user's entire chat history. Cloud backup of that
+          is a privacy leak, not a feature.
+        -->
+
+        <!--
+          extractNativeLibs="true" is required. The llama.cpp .so files are
+          large (tens of MB) and the downloader writes them into the APK's
+          jniLibs; with `false` the dynamic linker maps them straight from the
+          APK, which works on modern Android but breaks the `libOpenCL.so`
+          dlopen path on some OEM ROMs when combined with the optional
+          native-library declarations above. Left at the safe default.
+        -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/AppTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          OpenCL for llama.rn's GPU backend. `required="false"` is load-bearing:
+          with `true` the Play Store would filter the app off every device
+          without an Adreno GPU, which is most of them. The runtime checks
+          `LlamaContext.gpu` and falls back to CPU.
+
+          Placed inside <application> because AAPT2 rejects this element as a
+          direct child of <manifest> when linking an application module.
+        -->
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+
+        <!--
+          Hexagon NPU support (llama.rn, experimental). Snapdragon 8 Gen 1+
+          only. Same optional-not-required reasoning as OpenCL above.
+        -->
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
+
+        <!--
+          The RN template's default screen-size override; harmless and keeps
+          tablet Chromebooks from being filtered.
+        -->
+        <meta-data
+            android:name="android.max_aspect"
+            android:value="2.4" />
+
+        <!--
+          Phase 1 deliverable: the native module that exposes
+          ActivityManager.MemoryInfo and Context.getFilesDir() to JS.
+          Declared here as the registration site; the Kotlin class is not yet
+          written (see docs/roadmap.md Phase 1).
+        -->
+        <meta-data
+            android:name="com.phonellm.SYSTEM_MODULE"
+            android:value="PhoneLlmSystem" />
+
+    </application>
+
+    <!--
+      Explicitly NOT declaring android:requestLegacyExternalStorage, and NOT
+      requesting READ/WRITE_EXTERNAL_STORAGE or MANAGE_EXTERNAL_STORAGE.
+      Models live in app-private internal storage; no storage permission is
+      needed on any API level, which removes an entire class of support burden.
+    -->
+
+</manifest>
