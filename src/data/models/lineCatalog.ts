@@ -14,12 +14,41 @@
  * through the official index shape, and the two are kept distinguishable
  * downstream via `line`, so the UI can label them and the downloader can pick
  * the correct URL/verification strategy.
+ *
+ * ── Why the abliterated index is loaded defensively ─────────────────────────
+ * `data/models-jailbreak.json` is deliberately NOT in the public repository: it
+ * lists uncensored model sources, which is a liability to publish alongside a
+ * real identity and is not needed to build or understand the app.
+ *
+ * A plain `import` of an absent file is a hard failure — it breaks the whole
+ * bundle, so a fresh clone could neither build nor run its tests. That is what
+ * happened in CI. The load is therefore best-effort: when the file is missing
+ * the abliterated line resolves to an empty catalogue, `modelsForLine` returns
+ * an empty list, and everything else keeps working.
+ *
+ * The alternative — committing an empty placeholder file — was rejected because
+ * it leaves a lie in the tree: a real data file that is always empty. Absence is
+ * accurate, and the UI already has copy for "this build has no such line".
  */
 
-import rawJailbreak from '../../../data/models-jailbreak.json' with { type: 'json' }
+import { ABLITERATED_ENTRIES, type RawAbliteratedEntry } from './abliterated.generated.ts'
 import { MODEL_CATALOG, resolveArchitecture, type ArchitectureFacts } from './catalog.ts'
 import { INCLUDES_ABLITERATED } from '../../config/buildFlavor.ts'
 import type { ModelDescriptor, ModelFilePart, Quantization, ModelTag } from '../../types/domain'
+
+/**
+ * The abliterated catalogue comes from a generated module, not from the JSON.
+ *
+ * A static import of data/models-jailbreak.json would be a link-time error
+ * when that file is absent — and it IS absent from the published repository by
+ * design, so a fresh clone could neither build nor run a single test. That is
+ * how this project's first CI run failed.
+ *
+ * `abliterated.generated.ts` always exists: the published tree ships it with an
+ * empty array, and a working copy fills it in. Regenerate with
+ * `node scripts/embed-abliterated.mjs`.
+ */
+const rawJailbreak: RawJailbreakEntry[] = [...ABLITERATED_ENTRIES]
 
 /** Which catalogue a model belongs to. */
 export type CatalogLine = 'official' | 'abliterated'
