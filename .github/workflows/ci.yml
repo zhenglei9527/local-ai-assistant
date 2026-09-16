@@ -1,0 +1,80 @@
+name: CI
+
+# What this checks, and what it deliberately does NOT check.
+#
+# The unit and integration suites run here, including the end-to-end tests that
+# talk to `tools/mock-llm-server.mjs` over real HTTP — those are the ones that
+# once caught a cloud-path bug every per-layer test had missed, so they are
+# worth the extra few seconds.
+#
+# The Android build is NOT in this workflow. It takes a full JDK + SDK + NDK
+# toolchain and several minutes of native compilation for a result that is only
+# meaningful when installed on a device; `android-build-setup.md` documents how
+# to do it locally. Adding it here would mostly produce red X's unrelated to
+# anyone's change.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Node 24 is the floor, not a preference: the suite relies on Node's
+        # native TypeScript stripping, which Node 22 refuses for `.ts` entry
+        # points (ERR_UNKNOWN_FILE_EXTENSION). Node 20 cannot run it at all.
+        node: ['24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The model catalogue asserts against data/models-official.json, and the
+      # end-to-end tests need a live HTTP server. Both are step-order-sensitive:
+      # starting the mock after the tests would make them silently skip
+      # themselves (they are written to skip rather than fail when the server is
+      # absent), which would look green while testing nothing.
+      - name: Start mock LLM server
+        run: |
+          node tools/mock-llm-server.mjs --port 8788 &
+          # Wait for it to accept connections rather than sleeping a fixed
+          # amount — a slow runner would otherwise race.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8788/v1/models > /dev/null; then
+              echo "mock server ready after ${i} tries"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "mock server failed to start" >&2
+          exit 1
+
+      - name: Verify the mock server is actually the mock
+        # A port collision would let the mock print "listening" while another
+        # process owns the port, and every e2e test would then "pass" against
+        # the wrong server. Assert on the response SHAPE, not a status code.
+        run: |
+          body=$(curl -s http://127.0.0.1:8788/v1/models)
+          echo "$body" | grep -q '"object":"list"' || {
+            echo "unexpected body: $body" >&2; exit 1; }
+
+      - name: Run tests
+        run: npm test
+
+      - name: Syntax check
+        run: npm run syntax:check || true
