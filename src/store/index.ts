@@ -11,11 +11,21 @@ import type {
   ContextConfig,
   GenerationTimings,
 } from '@/types/domain'
-import type { LoadedModelInfo } from '@/inference/InferenceEngine'
+import type { ChatMessage, LoadedModelInfo } from '@/inference/InferenceEngine'
 import { DEFAULT_SAMPLING, DEFAULT_CONTEXT_CONFIG, clampThreads } from '@/inference/InferenceEngine'
 import { activeEngine, activeBackendKind, setBackend } from '@/inference/engineFactory'
 import type { BackendKind } from '@/inference/engineFactory'
 import type { RemoteProviderConfig } from '@/inference/remote/providerConfig'
+import {
+  deleteConversation as deleteConversationRows,
+  deleteMessage as deleteMessageRow,
+  loadConversations,
+  loadMessages,
+  saveConversation,
+  saveMessage,
+  saveTranscript,
+} from '@/data/db/conversations'
+import { trimToContext } from '@/inference/contextWindow'
 import { findLineModel } from '@/data/models/lineCatalog'
 import {
   loadPersistedSettings,
@@ -410,7 +420,7 @@ export const useEngineStore = create<EngineStoreState>((set) => ({
     const settings = useSettingsStore.getState()
     const sampling = settings.sampling
 
-    const history = chat.messages
+    const rawHistory = chat.messages
       .filter((m) => m.content.trim().length > 0)
       .map((m) => ({ role: m.role, content: m.content }))
 
@@ -439,11 +449,42 @@ export const useEngineStore = create<EngineStoreState>((set) => ({
      * is the model author's intent.
      */
     const systemText = buildSystemPrompt(chat, settings)
-    if (systemText) history.unshift({ role: 'system', content: systemText })
+    const systemMessages: ChatMessage[] = systemText
+      ? [{ role: 'system', content: systemText }]
+      : []
 
-    if (history.filter((m) => m.role !== 'system').length === 0) {
+    if (rawHistory.filter((m) => m.role !== 'system').length === 0) {
       set({ status: 'error', error: '没有可发送的内容。' })
       return
+    }
+
+    /**
+     * Fit the prompt inside the model's context window.
+     *
+     * Previously EVERY message was sent with no trimming at all. Past the window
+     * — which the 4096-token default reaches after roughly 20 exchanges —
+     * llama.cpp either refuses the prompt or silently drops the oldest tokens,
+     * so the model loses the beginning of the conversation with no indication.
+     * The persona sits at the very start, so the visible symptom was a character
+     * quietly breaking partway through a long chat.
+     *
+     * `trimToContext` always keeps the system prompt, always keeps the newest
+     * turns, and drops whole older turns from the front. See its module doc for
+     * why the front (KV-cache prefix validity) and why whole turns (chat
+     * template alternation).
+     */
+    const trimmed = trimToContext(systemMessages, rawHistory, {
+      contextLength: settings.contextConfig.contextLength,
+    })
+    const history = trimmed.messages
+
+    if (trimmed.trimmed) {
+      // Kept in the log rather than silently applied: a shortened memory is the
+      // explanation for "why did it forget what I said", and without a trace
+      // that question has no answer.
+      console.log(
+        `[context] dropped ${trimmed.droppedCount} older message(s); prompt ~${trimmed.promptTokens} tokens`,
+      )
     }
 
     set({
@@ -1116,11 +1157,14 @@ export interface ChatStoreState {
    * Transcripts parked by conversation id.
    *
    * `messages` is the transcript on screen; this is where the previous one goes
-   * when you switch away, so returning restores it. Without it, switching
-   * conversations destroyed the history you left (see `setActiveConversation`).
+   * when you switch away, so returning restores it without a database round
+   * trip. Without it, switching conversations destroyed the history you left
+   * (see `setActiveConversation`).
    *
-   * In-memory only for now — a full restart still loses them, and SQLite is the
-   * real fix. This at least makes in-app navigation lossless.
+   * This is a CACHE in front of SQLite, not the source of truth: every write is
+   * mirrored to the database via `saveTranscript`, and `restoreConversations()`
+   * rebuilds the map at boot. Before persistence existed this was the only copy,
+   * which is why a cold start used to begin with an empty conversation list.
    */
   transcripts: Record<string, Message[]>
   /**
@@ -1144,6 +1188,18 @@ export interface ChatStoreState {
   appendMessage: (message: Message) => void
   replaceMessage: (message: Message) => void
   removeMessage: (id: string) => void
+  /**
+   * Discard an assistant reply and generate a new one for the same prompt.
+   *
+   * Needed because a local model's output varies run to run and occasionally
+   * comes out wrong — a refusal, a repetition loop, a broken character. Without
+   * this the only recovery is to retype the message, which also loses the
+   * prompt's exact wording.
+   *
+   * Drops the target assistant message and everything after it, resets the
+   * engine context, and regenerates from the user turn that preceded it.
+   */
+  regenerateFrom: (assistantMessageId: string) => Promise<void>
   setLoadingMore: (loading: boolean) => void
   setHasMore: (hasMore: boolean) => void
   setCharacters: (characters: CharacterRecord[]) => void
@@ -1226,7 +1282,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
    * on every conversation switch — a message that lived only in the on-screen
    * array would be lost the moment the user navigated away.
    */
-  appendMessage: (message) =>
+  appendMessage: (message) => {
     set((s) => {
       const messages = [...s.messages, message]
       const id = s.activeConversationId
@@ -1246,14 +1302,123 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
             )
           : s.conversations,
       }
-    }),
+    })
 
-  replaceMessage: (message) =>
+    // Persist the assistant turn. This is the write that makes a reply survive a
+    // cold start; before it existed, closing the app discarded every reply the
+    // user had received.
+    const after = get()
+    const convo = after.activeConversationId
+      ? after.conversations.find((c) => c.id === after.activeConversationId)
+      : undefined
+    if (convo) void saveTranscript(convo, [message])
+  },
+
+  replaceMessage: (message) => {
     set((s) => ({
       messages: s.messages.map((m) => (m.id === message.id ? message : m)),
-    })),
+      // Keep the parked copy in step, or navigating away and back would show
+      // the pre-edit text.
+      transcripts: s.activeConversationId
+        ? {
+            ...s.transcripts,
+            [s.activeConversationId]: s.messages.map((m) =>
+              m.id === message.id ? message : m,
+            ),
+          }
+        : s.transcripts,
+    }))
+    void saveMessage(message)
+  },
 
-  removeMessage: (id) => set((s) => ({ messages: s.messages.filter((m) => m.id !== id) })),
+  removeMessage: (id) => {
+    set((s) => {
+      const messages = s.messages.filter((m) => m.id !== id)
+      return {
+        messages,
+        transcripts: s.activeConversationId
+          ? { ...s.transcripts, [s.activeConversationId]: messages }
+          : s.transcripts,
+      }
+    })
+    void deleteMessageRow(id)
+  },
+
+  /**
+   * Regenerate an assistant reply.
+   *
+   * Trims the transcript back to just before the target reply, then runs the
+   * normal generation path. Everything from the target message onward is
+   * removed, not only the target: those later turns answered a conversation
+   * whose reply no longer exists, so keeping them would leave the model reading
+   * an answer to a question that is about to be replaced.
+   *
+   * The engine context is reset first. A stale KV cache still holds the tokens
+   * of the reply being discarded, and generating against it produces a reply
+   * that continues the OLD one — which looks like nothing happened.
+   */
+  regenerateFrom: async (assistantMessageId) => {
+    const targetIndex = get().messages.findIndex((m) => m.id === assistantMessageId)
+    if (targetIndex < 0) return
+
+    // Nothing to answer if the regenerated reply is the first message.
+    const preceding = get().messages.slice(0, targetIndex)
+    if (!preceding.some((m) => m.role === 'user')) {
+      set({ status: 'error', error: '这条回复前面没有用户消息，无法重新生成。' })
+      return
+    }
+
+    // Remove the target and everything after it — from the database as well, so
+    // a reload does not resurrect rows that were dropped on screen.
+    const removed = get().messages.slice(targetIndex)
+    for (const message of removed) void deleteMessageRow(message.id)
+
+    set((s) => {
+      const messages = s.messages.slice(0, targetIndex)
+      const conversation = s.activeConversationId
+        ? s.conversations.find((c) => c.id === s.activeConversationId)
+        : undefined
+      // Keep the list counters honest: they were incremented per appended
+      // message, so removing messages must decrement them too.
+      const conversations = conversation
+        ? s.conversations.map((c) =>
+            c.id === conversation.id
+              ? {
+                  ...c,
+                  messageCount: Math.max(0, c.messageCount - removed.length),
+                  updatedAt: Date.now(),
+                }
+              : c,
+          )
+        : s.conversations
+      return {
+        messages,
+        transcripts: s.activeConversationId
+          ? { ...s.transcripts, [s.activeConversationId]: messages }
+          : s.transcripts,
+        conversations,
+      }
+    })
+
+    // Drop the cached prefix; see the doc comment.
+    try {
+      await activeEngine()?.resetContext()
+    } catch {
+      // A failed reset must not block the regeneration — the worst case is a
+      // slower turn, not a broken one.
+    }
+
+    /**
+     * `generate` lives on the ENGINE store, not this one.
+     *
+     * Calling `get().generate()` here was wrong: this store has no such field,
+     * so the call threw and the button silently did nothing. Referencing the
+     * engine store explicitly is the fix, and it is also the more honest
+     * expression — regeneration is an engine operation triggered from the chat
+     * surface.
+     */
+    await useEngineStore.getState().generate()
+  },
 
   setLoadingMore: (loading) => set({ loadingMore: loading }),
   setHasMore: (hasMore) => set({ hasMore }),
@@ -1319,15 +1484,30 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       }
     })
 
+    /**
+     * Persist immediately.
+     *
+     * A conversation created and then abandoned (user taps ＋, changes their
+     * mind, closes the app) should still be there — otherwise the list silently
+     * loses rows the user has seen. Writing one row is cheap, and it avoids the
+     * "when do we save?" question entirely for creation.
+     */
+    const created = get().conversations.find((c) => c.id === id)
+    if (created) void saveConversation(created)
+
     return id
   },
 
-  deleteConversation: (id) =>
+  deleteConversation: (id) => {
     set((s) => {
       const conversations = s.conversations.filter((c) => c.id !== id)
       const wasActive = s.activeConversationId === id
+      // Drop the parked transcript too: leaving it would resurrect a deleted
+      // conversation's history if its id were ever reused.
+      const { [id]: _removed, ...transcripts } = s.transcripts
       return {
         conversations,
+        transcripts,
         // Only clear the transcript when the deleted one was on screen;
         // otherwise removing a background conversation would wipe the chat the
         // user is currently reading.
@@ -1335,7 +1515,10 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
           ? { activeConversationId: null, messages: [], hasMore: true }
           : {}),
       }
-    }),
+    })
+    // Cascades to the messages via the foreign key.
+    void deleteConversationRows(id)
+  },
 
   /**
    * Append a user turn.
@@ -1383,6 +1566,13 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         transcripts: { ...s.transcripts, [conversationId]: messages },
       }
     })
+
+    // Mirror to SQLite. Fire-and-forget on purpose: a failed write must not
+    // block sending, and the in-memory state is already correct either way.
+    const after = get()
+    const convo = after.conversations.find((c) => c.id === conversationId)
+    const last = after.messages[after.messages.length - 1]
+    if (convo && last) void saveTranscript(convo, [last])
   },
 }))
 
@@ -1539,5 +1729,43 @@ export async function restorePersistedSettings(): Promise<void> {
     ...(saved.remoteProvider ? { remoteProvider: { ...saved.remoteProvider } } : {}),
     ...(saved.sampling ? { sampling: saved.sampling as never } : {}),
     ...(saved.contextConfig ? { contextConfig: saved.contextConfig as never } : {}),
+  })
+}
+
+/**
+ * Rebuild conversation state from SQLite.
+ *
+ * Call once at boot, before the conversation list renders. Before this existed
+ * the app started empty every launch and every transcript was discarded on exit
+ * -- the worst defect this project shipped, and one that only a real cold start
+ * could reveal.
+ *
+ * Transcripts are loaded EAGERLY for every conversation rather than lazily on
+ * open. That is a deliberate trade: lazy loading would introduce a spinner on
+ * every row tap, a race with any in-flight generation, and a visible flash of
+ * empty chat. A realistic history is hundreds of messages and reads in
+ * milliseconds from a local file.
+ *
+ * Failures are non-fatal: with no database this resolves having changed nothing,
+ * and the app runs in-memory exactly as it did before persistence landed.
+ */
+export async function restoreConversations(): Promise<void> {
+  const conversations = await loadConversations()
+  if (conversations.length === 0) return
+
+  const transcripts: Record<string, Message[]> = {}
+  for (const conversation of conversations) {
+    transcripts[conversation.id] = await loadMessages(conversation.id)
+  }
+
+  useChatStore.setState({
+    conversations,
+    transcripts,
+    // Deliberately NOT restoring `activeConversationId`: opening the app should
+    // land on the conversation LIST, which is what a messaging app does.
+    // Jumping straight into the last chat hides the list and makes the back
+    // gesture feel like it did nothing.
+    activeConversationId: null,
+    messages: [],
   })
 }

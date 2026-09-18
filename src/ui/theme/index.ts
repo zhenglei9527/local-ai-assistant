@@ -27,10 +27,30 @@ export const colors = {
   warning: '#D29922',
   danger: '#F85149',
 
-  /** Bubble colours for the chat transcript. */
-  bubbleUser: '#1F3A66',
+  /**
+   * Bubble colours.
+   *
+   * The user bubble was `#1F3A66` — the SAME value as `accentMuted`, which is
+   * also the avatar circle's fill. Against a near-black background the two read
+   * as one flat blue field, so a conversation row looked like a blur of blue
+   * rather than a bubble sitting on a surface.
+   *
+   * The user bubble is now a distinctly lighter, slightly desaturated blue: it
+   * has to separate from BOTH the background and the assistant bubble, and
+   * saturation alone was not doing that at this brightness.
+   */
+  bubbleUser: '#2D5AA8',
   bubbleAssistant: '#161B22',
   bubbleSystem: '#231A11',
+
+  /**
+   * Translucent overlay for pressed states.
+   *
+   * A dedicated token rather than scattering `rgba(...)` literals: the pressed
+   * tint has to work on the background, on both bubble colours, and on rows, so
+   * it is worth defining once.
+   */
+  pressed: 'rgba(255,255,255,0.06)',
 } as const
 
 export const spacing = {
@@ -51,10 +71,40 @@ export const radii = {
 } as const
 
 export const typography = {
-  title: { fontSize: 22, fontWeight: '700' as const },
+  title: { fontSize: 22, fontWeight: '700' as const, letterSpacing: -0.4 },
+  /**
+   * Screen subtitle under a header title.
+   *
+   * Split out from `caption` because the two have different jobs: a subtitle is
+   * a label for the screen and benefits from a little letter-spacing, while a
+   * caption is dense metadata (timestamps, counts) where tight tracking reads
+   * better.
+   */
+  subtitle: { fontSize: 12.5, lineHeight: 17, letterSpacing: 0.1 } as const,
   body: { fontSize: 15, lineHeight: 22 },
+  /** Message text gets slightly looser leading than generic body: chat bubbles
+   *  hold multi-line prose, and 22px leading is cramped at this size. */
+  message: { fontSize: 15.5, lineHeight: 23.5 },
   caption: { fontSize: 12, lineHeight: 16 },
   mono: { fontSize: 12, fontFamily: 'monospace' as const },
+} as const
+
+/**
+ * Elevation.
+ *
+ * Android honours `elevation`; iOS uses the shadow* pair. Both are declared so a
+ * raised surface (the composer, a modal sheet) reads as raised on either
+ * platform without branching at the call site.
+ */
+export const elevation = {
+  none: {},
+  low: {
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 1 },
+  },
 } as const
 
 /**

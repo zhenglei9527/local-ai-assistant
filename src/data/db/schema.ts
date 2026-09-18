@@ -135,28 +135,50 @@ export const CREATE_INDEXES: readonly string[] = [
  */
 export const MIGRATIONS: Readonly<Record<number, readonly string[]>> = {}
 
-/** Applies pragmas, tables, indexes and any pending migrations. */
+/**
+ * Applies pragmas, tables, indexes and any pending migrations.
+ *
+ * ── The shape this expects, and the two bugs it used to have ────────────────
+ * It is written against `@op-engineering/op-sqlite` 18.x, where:
+ *
+ *   - `executeBatch` takes `SQLBatchTuple[]` = `[sql] | [sql, params]`, NOT a
+ *     bare `string[]`. Passing strings made schema creation fail, so the app
+ *     would have had no tables at all.
+ *   - there is NO `getFirst`. Reading `PRAGMA user_version` through it always
+ *     resolved the optional away, so the version silently reset to the baseline
+ *     on every launch.
+ *
+ * Both are expressed in the parameter type below, so the compiler — and any
+ * caller — sees the real contract.
+ */
 export async function migrate(db: {
-  execute: (sql: string) => Promise<unknown>
-  executeBatch?: (sql: string[]) => Promise<unknown>
-  getFirst?: <T>(sql: string) => Promise<T | null>
+  execute: (sql: string, params?: unknown[]) => Promise<unknown>
+  /** op-sqlite takes `[sql]` or `[sql, params]` tuples, not plain strings. */
+  executeBatch?: (commands: Array<[string] | [string, unknown[]]>) => Promise<unknown>
+  /** Returns `{ rows: [...] }`; there is no `getFirst` in this binding. */
+  executeRows?: (sql: string, params?: unknown[]) => Promise<Array<Record<string, unknown>>>
 }): Promise<void> {
   for (const pragma of PRAGMAS) {
     await db.execute(pragma)
   }
 
+  const statements = [...CREATE_TABLES, ...CREATE_INDEXES]
   if (db.executeBatch) {
-    await db.executeBatch([...CREATE_TABLES, ...CREATE_INDEXES])
+    // Tuples, because the binding rejects bare strings.
+    await db.executeBatch(statements.map((sql) => [sql] as [string]))
   } else {
-    for (const stmt of [...CREATE_TABLES, ...CREATE_INDEXES]) {
+    for (const stmt of statements) {
       await db.execute(stmt)
     }
   }
 
-  let current = SCHEMA_VERSION
-  if (db.getFirst) {
-    const row = await db.getFirst<{ user_version: number }>('PRAGMA user_version;')
-    current = row?.user_version ?? 0
+  let current = 0
+  if (db.executeRows) {
+    const rows = await db.executeRows('PRAGMA user_version;')
+    // `PRAGMA user_version` returns one row with one column whose name varies
+    // by binding version, so read the first value rather than naming it.
+    const first = rows[0]
+    if (first) current = Number(Object.values(first)[0] ?? 0)
   }
 
   for (let v = current + 1; v <= SCHEMA_VERSION; v += 1) {

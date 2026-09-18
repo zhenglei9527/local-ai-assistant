@@ -1,19 +1,23 @@
 /**
  * Model picker for the chat composer.
  *
- * ── Why it lives next to the input ──────────────────────────────────────────
- * "Which model answers this message" is a property of the conversation you are
- * having, not a global setting you visit another tab to change. Putting the
- * control beside the composer keeps it one tap from the thought that prompted
- * it, and makes the current choice visible at all times — the user should never
- * have to wonder which model just replied.
+ * ── Why it is a "+" beside the send button ──────────────────────────────────
+ * It used to be a wide pill to the LEFT of the input, carrying the model name.
+ * That occupied a large share of a phone's composer width for information the
+ * user rarely changes mid-conversation, and it pushed the actual text field —
+ * the thing being used constantly — into whatever space was left. On a narrow
+ * screen the input ended up short enough to be awkward.
+ *
+ * A "+" tap target costs one icon's width. The current model is still always
+ * visible: it is shown in the header subtitle above the transcript, which is
+ * where a user looks to answer "which model just replied".
  *
  * ── What it lists ───────────────────────────────────────────────────────────
  * Downloaded local models first (they are the ones that work offline), then the
- * cloud endpoint if one is configured. Models that are still downloading are
- * shown disabled rather than hidden: a user who just started a 4 GB download
- * needs to see it exists and is not ready, otherwise the list looks empty and
- * they start it again.
+ * cloud endpoint if one is configured. Models still downloading appear disabled
+ * rather than hidden: a user who just started a 4 GB download needs to see it
+ * exists and is not ready, otherwise the list looks empty and they start it
+ * again.
  */
 
 import React, { useCallback, useMemo, useState } from 'react'
@@ -27,7 +31,7 @@ import {
   View,
 } from 'react-native'
 
-import { colors, radii, spacing, typography } from '@/ui/theme'
+import { colors, spacing, typography } from '@/ui/theme'
 import { OFFICIAL_LINE, type LineDescriptor } from '@/data/models/lineCatalog'
 import { formatBytes } from '@/data/models/memoryProbe'
 import { useEngineStore, useModelStore, useSettingsStore } from '@/store'
@@ -129,18 +133,19 @@ export function ModelPickerButton(): React.JSX.Element {
     <>
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={`当前模型：${currentLabel}，点击切换`}
+        accessibilityLabel={`切换模型（当前：${currentLabel}）`}
         onPress={() => setOpen(true)}
-        style={({ pressed }) => [styles.trigger, pressed && styles.pressed]}
+        style={({ pressed }) => [
+          styles.trigger,
+          busy && styles.triggerBusy,
+          pressed && styles.pressed,
+        ]}
       >
         {busy ? (
           <ActivityIndicator size="small" color={colors.accent} />
         ) : (
-          <Text style={styles.triggerGlyph}>{'\u{1F9E0}'}</Text>
+          <Text style={styles.triggerGlyph}>＋</Text>
         )}
-        <Text style={styles.triggerText} numberOfLines={1}>
-          {busy ? '切换中…' : shortLabel(currentLabel)}
-        </Text>
       </Pressable>
 
       <Modal
@@ -152,9 +157,15 @@ export function ModelPickerButton(): React.JSX.Element {
         <Pressable style={styles.backdrop} onPress={() => setOpen(false)}>
           {/* Stop taps inside the sheet from closing it. */}
           <Pressable style={styles.sheet} onPress={() => {}}>
+            <View style={styles.grabber} />
             <Text style={styles.sheetTitle}>选择模型</Text>
-            <Text style={styles.sheetHint}>
-              切换会立即生效：本地模型需要几秒重新加载。
+            {/*
+              Surfacing the current model HERE matters more now that the trigger
+              is an unlabelled "+": without it the sheet would open with no
+              indication of what is already active beyond the row highlight.
+            */}
+            <Text style={styles.sheetHint} numberOfLines={1}>
+              当前：{currentLabel}
             </Text>
 
             <ScrollView style={styles.list} keyboardShouldPersistTaps="handled">
@@ -228,59 +239,74 @@ function noteFor(state: string): string {
   }
 }
 
-/** Keeps the trigger from crowding the composer on a narrow phone. */
-function shortLabel(name: string): string {
-  const slash = name.indexOf('/')
-  const base = slash > 0 ? name.slice(0, slash) : name
-  return base.length > 14 ? `${base.slice(0, 13)}…` : base
-}
-
 const styles = StyleSheet.create({
+  /**
+   * Square "+" button, sized to match the send button beside it.
+   *
+   * 44x44 is the minimum touch target both Android and iOS agree on, and keeping
+   * it square means the composer's three controls (+, input, send) share one
+   * baseline height instead of looking misaligned.
+   */
   trigger: {
-    flexDirection: 'row',
+    width: 44,
+    height: 44,
     alignItems: 'center',
-    gap: spacing.xs,
-    maxWidth: 128,
-    minHeight: 44,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radii.md,
+    justifyContent: 'center',
+    borderRadius: 22,
     backgroundColor: colors.surfaceRaised,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
   },
-  triggerGlyph: { fontSize: 14 },
-  triggerText: { ...typography.caption, color: colors.text, flexShrink: 1 },
+  triggerBusy: { borderColor: colors.accent },
+  /**
+   * The glyph is text, not an icon font.
+   *
+   * `＋` (U+FF0B, fullwidth) rather than `+`: the ASCII form sits on the
+   * baseline and looks off-centre in a circle, while the fullwidth form is
+   * optically centred and matches the CJK text around it.
+   */
+  triggerGlyph: { fontSize: 20, color: colors.textMuted, lineHeight: 24 },
 
   backdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: 'rgba(0,0,0,0.62)',
     justifyContent: 'flex-end',
   },
   sheet: {
     backgroundColor: colors.surface,
-    borderTopLeftRadius: radii.lg,
-    borderTopRightRadius: radii.lg,
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
     paddingHorizontal: spacing.lg,
-    paddingTop: spacing.lg,
+    paddingTop: spacing.sm,
     paddingBottom: spacing.xl,
     maxHeight: '75%',
     gap: spacing.xs,
   },
-  sheetTitle: { ...typography.title, color: colors.text },
-  sheetHint: { ...typography.caption, color: colors.textMuted, marginBottom: spacing.sm },
+  /** The little handle that signals "this sheet can be dismissed". */
+  grabber: {
+    alignSelf: 'center',
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: colors.border,
+    marginBottom: spacing.md,
+  },
+  sheetTitle: { ...typography.title, fontSize: 19, color: colors.text },
+  sheetHint: { ...typography.caption, color: colors.textMuted, marginBottom: spacing.md },
   list: { flexGrow: 0 },
 
   row: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: spacing.md,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radii.md,
+    paddingVertical: 13,
+    paddingHorizontal: spacing.md,
+    borderRadius: 14,
     gap: spacing.sm,
   },
   rowActive: { backgroundColor: colors.accentMuted },
   rowDisabled: { opacity: 0.45 },
-  rowBody: { flex: 1, gap: 2 },
+  /** `minWidth: 0` so a long model name truncates instead of overflowing. */
+  rowBody: { flex: 1, minWidth: 0, gap: 2 },
   rowLabel: { ...typography.body, color: colors.text, fontWeight: '600' },
   rowLabelActive: { color: colors.accent },
   rowDetail: { ...typography.caption, color: colors.textMuted },
@@ -294,13 +320,13 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.xxl,
   },
   close: {
-    marginTop: spacing.sm,
-    minHeight: 44,
+    marginTop: spacing.md,
+    minHeight: 48,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: radii.md,
+    borderRadius: 24,
     backgroundColor: colors.surfaceRaised,
   },
-  closeText: { ...typography.body, color: colors.textMuted },
+  closeText: { ...typography.body, color: colors.textMuted, fontWeight: '600' },
   pressed: { opacity: 0.75 },
 })

@@ -71,19 +71,31 @@ export function ScreenScaffold({
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
+  /**
+   * Header.
+   *
+   * Was a plain row with a hairline divider, which made every screen read like a
+   * settings list. Three changes give it a sense of being a surface rather than
+   * a strip:
+   *
+   *   - `surface` fill instead of the page colour, so header and content are
+   *     visibly different planes.
+   *   - No divider. The colour change already separates them, and a line on top
+   *     of a colour change is redundant.
+   *   - More bottom padding: the title sat tight against the first row.
+   */
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.sm,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
+    paddingBottom: spacing.md,
+    backgroundColor: colors.surface,
   },
-  headerText: { flex: 1 },
+  headerText: { flex: 1, justifyContent: 'center' },
   headerLeading: { marginRight: spacing.sm },
   headerAction: { marginLeft: spacing.md },
   headerTitle: { ...typography.title, color: colors.text },
-  headerSubtitle: { ...typography.caption, color: colors.textMuted, marginTop: 2 },
+  headerSubtitle: { ...typography.subtitle, color: colors.textMuted, marginTop: 3 },
   body: { flex: 1 },
   bodyContent: { padding: spacing.lg, gap: spacing.md },
 })

@@ -158,4 +158,41 @@ describe('conversation transcripts', () => {
       ['保留这条'],
     )
   })
+
+  test('deleting a conversation also drops its parked transcript', () => {
+    // Parked transcripts are keyed by conversation id. Leaving one behind means
+    // a deleted conversation's history could reappear the moment an id is
+    // reused — ghost data the user cannot explain or remove.
+    const a = useChatStore.getState().createConversation(null)
+    useChatStore.getState().appendUser('要删掉的对话')
+    const b = useChatStore.getState().createConversation(null)
+    useChatStore.getState().appendUser('保留的对话')
+
+    // Parking happens on switch-away, so navigate once to populate the map.
+    useChatStore.getState().setActiveConversation(a)
+    useChatStore.getState().setActiveConversation(b)
+    assert.ok(useChatStore.getState().transcripts[a], 'a should be parked')
+
+    useChatStore.getState().deleteConversation(a)
+
+    assert.equal(
+      useChatStore.getState().transcripts[a],
+      undefined,
+      'the deleted transcript must not linger',
+    )
+    assert.ok(useChatStore.getState().transcripts[b], 'the other transcript must survive')
+  })
+
+  test('deleting the open conversation clears the screen', () => {
+    const a = useChatStore.getState().createConversation(null)
+    useChatStore.getState().appendUser('正在看的对话')
+
+    useChatStore.getState().deleteConversation(a)
+
+    // The navigator shows the list when `activeConversationId` is null; leaving
+    // it set would strand the user on the transcript of a conversation that no
+    // longer exists.
+    assert.equal(useChatStore.getState().activeConversationId, null)
+    assert.equal(useChatStore.getState().messages.length, 0)
+  })
 })

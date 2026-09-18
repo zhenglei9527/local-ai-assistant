@@ -8,7 +8,14 @@ import { ModelManagerScreen } from '@/ui/screens/ModelManagerScreen'
 import { CharacterScreen } from '@/ui/screens/CharacterScreen'
 import { SettingsScreen } from '@/ui/screens/SettingsScreen'
 import { colors, radii, spacing, typography } from '@/ui/theme'
-import { useChatStore, useEngineStore, useModelStore, useSettingsStore, restorePersistedSettings } from '@/store'
+import {
+  useChatStore,
+  useEngineStore,
+  useModelStore,
+  useSettingsStore,
+  restoreConversations,
+  restorePersistedSettings,
+} from '@/store'
 
 /**
  * Tab navigator.
@@ -68,6 +75,9 @@ export function AppNavigator(): React.JSX.Element {
       // `backend` out of the settings store, and restoring afterwards would
       // boot with defaults (no remembered model, wrong backend).
       await restorePersistedSettings()
+      // Conversations BEFORE anything that reads them: the list renders from
+      // store state, and restoring later would show an empty screen first.
+      await restoreConversations()
       await reconcileFromDisk()
       const wanted = useSettingsStore.getState().lastLoadedModelId
       if (!wanted) return

@@ -21,6 +21,7 @@
 
 import React, { useCallback, useMemo, useState } from 'react'
 import {
+  Alert,
   FlatList,
   Pressable,
   StyleSheet,
@@ -50,6 +51,7 @@ export function ConversationListScreen({
   const messages = useChatStore((s) => s.messages)
   const characters = useChatStore((s) => s.characters)
   const createConversation = useChatStore((s) => s.createConversation)
+  const deleteConversation = useChatStore((s) => s.deleteConversation)
 
   const [query, setQuery] = useState('')
 
@@ -128,15 +130,38 @@ export function ConversationListScreen({
     onOpen(id)
   }, [createConversation, onOpen])
 
+  /**
+   * Confirm before deleting.
+   *
+   * A long-press is easy to trigger by accident while scrolling, and a
+   * conversation holds text the user cannot get back. Confirming is the
+   * difference between a gesture and an accident.
+   */
+  const confirmDelete = useCallback(
+    (conversation: Conversation) => {
+      const title = conversation.title || '这个对话'
+      Alert.alert('删除对话', `确定要删除「${title}」吗？此操作无法撤销。`, [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '删除',
+          style: 'destructive',
+          onPress: () => deleteConversation(conversation.id),
+        },
+      ])
+    },
+    [deleteConversation],
+  )
+
   const renderItem = useCallback(
     ({ item }: { item: Hit }) => (
       <ConversationRow
         hit={item}
         characterName={nameOf(item.conversation.characterId)}
         onPress={() => onOpen(item.conversation.id)}
+        onDelete={() => confirmDelete(item.conversation)}
       />
     ),
-    [nameOf, onOpen],
+    [nameOf, onOpen, confirmDelete],
   )
 
   const searching = query.trim().length > 0
@@ -210,10 +235,12 @@ function ConversationRow({
   hit,
   characterName,
   onPress,
+  onDelete,
 }: {
   hit: Hit
   characterName: string | null
   onPress: () => void
+  onDelete: () => void
 }): React.JSX.Element {
   const { conversation, snippet } = hit
   const title = characterName ?? conversation.title
@@ -222,8 +249,11 @@ function ConversationRow({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`打开对话 ${title}`}
+      accessibilityHint="长按可删除"
       onPress={onPress}
-      style={({ pressed }) => [styles.row, pressed && styles.pressed]}
+      onLongPress={onDelete}
+      delayLongPress={400}
+      style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
     >
       <View style={styles.avatar}>
         <Text style={styles.avatarGlyph}>{title.charAt(0) || '?'}</Text>
@@ -304,29 +334,47 @@ const styles = StyleSheet.create({
 
   list: { paddingHorizontal: spacing.lg, paddingBottom: spacing.lg, gap: spacing.xs },
 
+  /**
+   * Comfortable row height with a pressed state.
+   *
+   * The row had no pressed feedback at all before — tapping a conversation
+   * looked like nothing happened until the screen changed, which on a slow load
+   * reads as a dropped tap. The tint also has to be subtle: a full-row highlight
+   * at this size is heavier than a messaging app wants.
+   */
   row: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: spacing.md,
-    paddingVertical: spacing.md,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radii.md,
+    gap: 14,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.md,
+    borderRadius: 14,
   },
+  rowPressed: { backgroundColor: colors.pressed },
   rowBody: { flex: 1, gap: 2 },
   rowTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing.sm },
-  rowTitle: { ...typography.body, color: colors.text, fontWeight: '600', flex: 1 },
+  rowTitle: { ...typography.body, color: colors.text, fontWeight: '600' as const, flex: 1, letterSpacing: -0.1 },
   rowTime: { ...typography.caption, color: colors.textFaint },
-  rowSnippet: { ...typography.caption, color: colors.textMuted },
+  rowSnippet: { ...typography.caption, color: colors.textMuted, lineHeight: 17 },
 
   avatar: {
-    width: 48,
-    height: 48,
+    width: 46,
+    height: 46,
     borderRadius: radii.pill,
-    backgroundColor: colors.accentMuted,
+    backgroundColor: colors.surfaceRaised,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  avatarGlyph: { ...typography.title, color: colors.accent },
+  /**
+   * The initial reads as a monogram, not a title.
+   *
+   * It was 	ypography.title at 22px in the accent blue on an accent-tinted
+   * circle — the loudest element on the screen, for the least important
+   * information. Smaller and neutral lets the conversation title carry the row.
+   */
+  avatarGlyph: { fontSize: 18, fontWeight: '600' as const, color: colors.textMuted },
 
   empty: { alignItems: 'center', padding: spacing.xxl, gap: spacing.sm, marginTop: spacing.xxl },
   emptyGlyph: { fontSize: 40 },
