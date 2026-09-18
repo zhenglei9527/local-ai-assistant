@@ -26,7 +26,7 @@ export function CharacterScreen(): React.JSX.Element {
   const characters = useChatStore((s) => s.characters)
   const activeCharacterId = useChatStore((s) => s.activeCharacterId)
   const selectCharacter = useChatStore((s) => s.selectCharacter)
-  const setCharacters = useChatStore((s) => s.setCharacters)
+  const addCharacter = useChatStore((s) => s.addCharacter)
 
   const [importing, setImporting] = useState(false)
 
@@ -39,8 +39,10 @@ export function CharacterScreen(): React.JSX.Element {
 
       // Replace an existing card with the same name rather than silently
       // accumulating duplicates every time the same file is re-imported.
-      const others = characters.filter((c) => c.card.data.name !== result.card.data.name)
-      setCharacters([...others, result])
+      // The store owns that de-duplication AND the write to SQLite — doing it
+      // here against local state is what made imports memory-only and cost the
+      // card on the next launch.
+      addCharacter(result)
       selectCharacter(result.id)
       Alert.alert('导入成功', `已导入「${result.card.data.name}」`)
     } catch (error) {
@@ -51,7 +53,7 @@ export function CharacterScreen(): React.JSX.Element {
     } finally {
       setImporting(false)
     }
-  }, [importing, characters, setCharacters, selectCharacter])
+  }, [importing, addCharacter, selectCharacter])
 
   const renderItem = useCallback(
     ({ item }: { item: CharacterRecord }) => (

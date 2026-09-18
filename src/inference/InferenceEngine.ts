@@ -174,7 +174,24 @@ export const DEFAULT_SAMPLING: SamplingParams = {
 
 /** Conservative context defaults; the memory probe raises them when it can. */
 export const DEFAULT_CONTEXT_CONFIG: ContextConfig = {
-  contextLength: 4096,
+  /**
+   * 8192, raised from 4096.
+   *
+   * The bundled model (Qwen2.5-3B) supports 32768 natively, so 4096 left seven
+   * eighths of its capacity unused and trimmed conversations after roughly
+   * 15–20 exchanges — the symptom being that the model forgets what was said.
+   *
+   * 8192 doubles the usable conversation length while bounding the cost:
+   *
+   *   - KV cache: about 1.0 GiB at f16, on a device with far more than that.
+   *   - Prefill: about a minute for a FULL window, paid once per turn, and only
+   *     when the prompt is genuinely that long. A short chat is unaffected.
+   *
+   * 16384 was rejected as a default: prefill reaches 2–4 minutes on a large
+   * character card, which reads as a frozen app rather than a slow one. Users
+   * who want more can raise it in Settings.
+   */
+  contextLength: 8192,
   batchSize: 512,
   threads: 4,
   gpuLayers: 0,

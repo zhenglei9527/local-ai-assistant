@@ -23,9 +23,44 @@ import {
   loadMessages,
   saveConversation,
   saveMessage,
+  saveMessageSwipes,
   saveTranscript,
 } from '@/data/db/conversations'
+import {
+  deleteCharacter as deleteCharacterRow,
+  loadCharacters,
+  saveCharacter as saveCharacterRow,
+} from '@/data/db/characters'
+import {
+  loadSummary,
+  saveSummary,
+  type StoredSummary,
+} from '@/data/db/summaries'
+import {
+  buildSummaryPrompt,
+  buildTranscript,
+  cleanSummary,
+  DEFAULT_SUMMARIZE_CONFIG,
+  formatSummaryForPrompt,
+  shouldSummarize,
+  toStoredSummary,
+  transcriptChars,
+  type SummarizeConfig,
+} from '@/memory/summarize'
 import { trimToContext } from '@/inference/contextWindow'
+/**
+ * Multi-version reply helpers.
+ *
+ * Pure functions in their own module rather than methods on the store: the
+ * `content === swipes[swipeIndex]` invariant is the one thing in this feature
+ * that corrupts a conversation SILENTLY when broken (the user reads version 2
+ * while the model is sent version 1), so it gets exactly one implementation
+ * that every call site routes through — and that implementation is testable
+ * without a store, an engine, or a database.
+ */
+import { appendSwipe, stepSwipe, swipesOf, withSwipeIndex } from '@/store/swipe'
+import { buildPrompt } from '@/character-card/buildPrompt'
+import { alternateOpeningsFor, makeAssembleInput, openingMessageFor } from '@/character-card/adapter'
 import { findLineModel } from '@/data/models/lineCatalog'
 import {
   loadPersistedSettings,
@@ -448,7 +483,36 @@ export const useEngineStore = create<EngineStoreState>((set) => ({
      * empty one: llama.cpp then applies the template baked into the GGUF, which
      * is the model author's intent.
      */
-    const systemText = buildSystemPrompt(chat, settings)
+    /**
+     * Fold in the rolling summary, if this conversation has one.
+     *
+     * The summary is the answer to "the window trimmed away the start of this
+     * conversation and the model forgot". `buildSystemPrompt` is synchronous,
+     * so the await has to live here in the caller rather than inside it.
+     *
+     * Awaited rather than fire-and-forget: a turn generated WITHOUT the summary
+     * is exactly the amnesia the feature exists to prevent.
+     *
+     * Failure is not fatal — a missing summary degrades to the previous
+     * behaviour, which is a shorter memory rather than a broken turn.
+     */
+    let summaryText = ""
+    try {
+      summaryText = (await getSummaryForPrompt(chat.activeConversationId ?? "")) ?? ""
+    } catch {
+      summaryText = ""
+    }
+
+    const baseSystemText = buildSystemPrompt(
+      chat,
+      settings,
+      settings.contextConfig.contextLength,
+    )
+    const systemText = summaryText
+      ? baseSystemText
+        ? `${baseSystemText}${"\n\n"}${summaryText}`
+        : summaryText
+      : baseSystemText
     const systemMessages: ChatMessage[] = systemText
       ? [{ role: 'system', content: systemText }]
       : []
@@ -519,6 +583,18 @@ export const useEngineStore = create<EngineStoreState>((set) => ({
       )
 
       const text = outcome.text
+
+      /**
+       * Roll the memory forward, AFTER this turn is committed.
+       *
+       * Deliberately not awaited. Summarising is a second generation of its own,
+       * so awaiting it would keep the UI in a generating state for as long as a
+       * whole extra reply takes — for a background housekeeping task the user
+       * never asked for. `maybeSummarize` swallows its own failures and its own
+       * trigger condition decides whether any work happens at all.
+       */
+      void maybeSummarize(useChatStore.getState().activeConversationId ?? '')
+
       set({
         status: 'ready',
         streamingText: '',
@@ -532,17 +608,48 @@ export const useEngineStore = create<EngineStoreState>((set) => ({
       // touched `messages` during streaming (see the module header), so this is
       // the single write for the whole turn.
       if (text.trim().length > 0) {
-        chat.appendMessage({
-          id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          conversationId: chat.activeConversationId ?? '',
-          role: 'assistant',
-          content: text,
-          reasoning: outcome.reasoning,
-          createdAt: Date.now(),
-          modelId: useEngineStore.getState().modelId,
-          swipeIndex: 0,
-          swipes: [],
-        })
+        /**
+         * ── Where a regenerated reply lands ────────────────────────────────────
+         *
+         * `regenerateFrom`/`regenerateSwipe` set `pendingSwipeTargetId` before
+         * calling us. When it is set, this generation is a RE-ROLL of that
+         * turn, and its text must be APPENDED AS A VERSION of that message.
+         *
+         * Appending a sibling instead would put two assistant messages in a row
+         * answering one user turn: wrong for the model (the chat template
+         * alternates user/assistant) and wrong on screen (two bubbles, with an
+         * arrow row on only one of them, and the version list never growing).
+         *
+         * ⚠️ The target id is taken from the marker, NOT inferred from "the last
+         * message has a version list". A first-time regeneration leaves exactly
+         * ONE version after seeding, so a `length > 1` test silently fails and
+         * the sibling bug returns.
+         *
+         * The marker is cleared unconditionally below, so a later ordinary turn
+         * appends normally even if this generation produced nothing.
+         */
+        const live = useChatStore.getState()
+        const target = pendingSwipeTargetId
+        pendingSwipeTargetId = null
+        const seeded = target ? live.messages.find((m) => m.id === target) : undefined
+
+        if (seeded && seeded.role === 'assistant') {
+          const updated = appendSwipe(seeded, text)
+          live.replaceMessage(updated)
+          void saveMessageSwipes(updated.id, updated.swipes, updated.swipeIndex)
+        } else {
+          live.appendMessage({
+            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            conversationId: chat.activeConversationId ?? '',
+            role: 'assistant',
+            content: text,
+            reasoning: outcome.reasoning,
+            createdAt: Date.now(),
+            modelId: useEngineStore.getState().modelId,
+            swipeIndex: 0,
+            swipes: [text],
+          })
+        }
       }
     } catch (error) {
       set({
@@ -1110,39 +1217,53 @@ async function loadLocalModel(
  * and others skip it, so the same input produces different prompts across
  * models.
  *
- * The character's own text comes first and the user's global prompt second.
- * That order makes the global prompt an *additional instruction* rather than a
- * replacement: if a card says "you are a gruff sea captain" and the global
- * prompt says "answer in Chinese", appending preserves both. Putting the global
- * prompt first would let a card's description bury it.
+ * This delegates to `buildPrompt`, which is the full SillyTavern-grade
+ * assembler (world info with all 8 insertion positions and keyword triggers,
+ * dialogue examples, author's note, prompt_order). It previously assembled a
+ * hand-rolled five-line summary here and, as a direct consequence, an imported
+ * card's `character_book` was silently dropped — the world info never reached
+ * the model at all.
+ *
+ * ⚠️ `buildPrompt` returns `{systemPrompt, messages}`, but this function's
+ * signature returns only `string`. That is a real lossy boundary and it is
+ * handled deliberately rather than papered over:
+ *
+ *   - Everything that lands in `systemPrompt` (main / worldInfoBefore /
+ *     charDescription / charPersonality / scenario / worldInfoAfter /
+ *     dialogueExamples / jailbreak) is returned and sent.
+ *   - World-info entries positioned at `AtDepth`, plus the author's note, are
+ *     injected as extra entries INSIDE `messages`. Those cannot be expressed
+ *     as one string without inventing a fake chat turn, so they are dropped
+ *     here. `adapter.ts` therefore passes no `authorsNote`, and `AtDepth`
+ *     entries are a documented, known gap — closing it needs the caller to
+ *     consume `BuiltPrompt.messages` directly instead of calling this.
+ *
+ * `contextLength` is accepted because the world-info token budget is a
+ * percentage of the window; without it the budget defaults to 0 and a large
+ * lorebook would be budget-starved.
  */
 export function buildSystemPrompt(
   chat: { characters: CharacterRecord[]; activeCharacterId: string | null },
   settings: { systemPrompt: string },
+  contextLength = DEFAULT_CONTEXT_CONFIG.contextLength,
 ): string {
-  const parts: string[] = []
-
   const character = chat.activeCharacterId
     ? chat.characters.find((c) => c.id === chat.activeCharacterId)
-    : undefined
+    : null
 
-  if (character) {
-    const d = character.card.data
-    const lines: string[] = []
-    // Name first, because almost every downstream behaviour (self-reference,
-    // staying in character) depends on the model knowing what it is called.
-    if (d.name) lines.push(`你的名字是「${d.name}」。`)
-    if (d.description) lines.push(d.description)
-    if (d.personality) lines.push(`性格：${d.personality}`)
-    if (d.scenario) lines.push(`背景设定：${d.scenario}`)
-    if (d.system_prompt) lines.push(d.system_prompt)
-    if (lines.length > 0) parts.push(lines.join('\n'))
-  }
+  // Conversation history is intentionally NOT passed: the caller already owns
+  // history assembly and trims it with `trimToContext` immediately afterwards,
+  // so feeding the same transcript in here would only duplicate that work and
+  // risk the two disagreeing. What this function contributes is the *static*
+  // prefix — which is exactly the part that was missing.
+  const input = makeAssembleInput({
+    character,
+    messages: [],
+    globalSystemPrompt: settings.systemPrompt,
+    contextLength,
+  })
 
-  const global = settings.systemPrompt.trim()
-  if (global) parts.push(global)
-
-  return parts.join('\n\n')
+  return buildPrompt(input).systemPrompt
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,12 +1319,61 @@ export interface ChatStoreState {
    *
    * Drops the target assistant message and everything after it, resets the
    * engine context, and regenerates from the user turn that preceded it.
+   *
+   * ⚠️ The NEW reply is appended to `swipes` rather than replacing `content`
+   * in place — see the implementation for why that did NOT change the
+   * "drop everything after it" behaviour.
    */
   regenerateFrom: (assistantMessageId: string) => Promise<void>
+  /**
+   * Move to the next / previous stored version of an assistant reply.
+   *
+   * ── Why this is separate from `regenerateFrom` ──────────────────────────────
+   * Regenerating DISCARDS the visible reply and pays for another one. A user who
+   * has already waited out a local model's answer does not want to lose it just
+   * to compare — they want to flip between the two. SillyTavern calls these
+   * "swipes", and `Message.swipes` / `Message.swipeIndex` were designed for it
+   * from the start.
+   *
+   * Both WRAP, so "previous" on the first version lands on the last. Disabling
+   * the arrows at the ends would make the most common case — two versions,
+   * sitting on the newer one, wanting the older one — need a hunt for whichever
+   * arrow happens to be live.
+   *
+   * Synchronous and local: nothing is generated, so there is no promise to await
+   * and the UI cannot be left showing a spinner.
+   */
+  nextSwipe: (messageId: string) => void
+  prevSwipe: (messageId: string) => void
+  /**
+   * Append a freshly generated version to a reply's `swipes` and show it.
+   *
+   * The non-destructive sibling of `regenerateFrom`: existing versions stay in
+   * the array and the new one is appended, so the user can flip back to the
+   * reply they just replaced.
+   */
+  regenerateSwipe: (messageId: string) => Promise<void>
   setLoadingMore: (loading: boolean) => void
   setHasMore: (hasMore: boolean) => void
   setCharacters: (characters: CharacterRecord[]) => void
   selectCharacter: (id: string | null) => void
+  /**
+   * Add or replace a card in the library AND persist it.
+   *
+   * Replaces an existing entry with the same `id`, or -- when none matches --
+   * one with the same card name. Name-matching is what the import flow relies
+   * on: `importCard` hashes the file name and a timestamp into the id, so
+   * re-importing the same file yields a DIFFERENT id and would otherwise
+   * accumulate a duplicate row on every attempt.
+   *
+   * Fire-and-forget by design. The write is not awaited: dropping a card into
+   * the library must not wait on (or fail with) a disk round trip, and
+   * `saveCharacter` never rejects. Losing a save is recoverable by
+   * re-importing; a frozen import button is not.
+   */
+  addCharacter: (record: CharacterRecord) => void
+  /** Remove a card from the library and from SQLite. */
+  removeCharacter: (id: string) => void
   /** Append a user message to the transcript. */
   appendUser: (content: string) => void
   /**
@@ -1226,6 +1396,19 @@ export interface ChatStoreState {
  * chat histories.
  */
 let conversationCounter = 0
+
+/**
+ * Message id that the NEXT completed generation must extend with a new version,
+ * rather than following with a fresh assistant message.
+ *
+ * Module-scope rather than a store field because it is transient intent, not
+ * user-visible state: nothing renders it, it must never be persisted, and a
+ * store field would invite a component to read it. `generate` clears it as soon
+ * as it consumes it.
+ *
+ * See `regenerateFrom` for why this cannot be inferred from the transcript.
+ */
+let pendingSwipeTargetId: string | null = null
 
 export const useChatStore = create<ChatStoreState>((set, get) => ({
   conversations: [],
@@ -1347,19 +1530,35 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   /**
    * Regenerate an assistant reply.
    *
-   * Trims the transcript back to just before the target reply, then runs the
-   * normal generation path. Everything from the target message onward is
-   * removed, not only the target: those later turns answered a conversation
-   * whose reply no longer exists, so keeping them would leave the model reading
-   * an answer to a question that is about to be replaced.
+   * ── How swipes changed this, and how they did not ───────────────────────────
+   * The reply being replaced is no longer DESTROYED. Its text is folded into
+   * `swipes` first, so the user can arrow back to the answer they just spent
+   * thirty seconds waiting for. Before this, "重新生成" was the only recovery
+   * from a bad local-model reply, and it was a one-way door.
+   *
+   * The target message is also no longer deleted from the transcript. It is
+   * re-used as the carrier for the new version, which keeps its id, timestamp
+   * and any markers attributable to the same turn.
+   *
+   * ⚠️ What did NOT change: everything AFTER the target is still removed, from
+   * screen and from the database. Those later turns answered a conversation
+   * whose reply is being replaced, so keeping them would leave the model reading
+   * an answer to a question that no longer exists.
+   *
+   * The two rules do not conflict. A version list belongs to ONE turn — the
+   * answer to the preceding user message. "Drop what follows" is about LATER
+   * turns. Regenerating turn 1 says nothing about the validity of a reply to
+   * turn 2, so turn 1's alternatives are kept while turn 2 is still discarded.
    *
    * The engine context is reset first. A stale KV cache still holds the tokens
-   * of the reply being discarded, and generating against it produces a reply
+   * of the version being replaced, and generating against it produces a reply
    * that continues the OLD one — which looks like nothing happened.
    */
   regenerateFrom: async (assistantMessageId) => {
     const targetIndex = get().messages.findIndex((m) => m.id === assistantMessageId)
     if (targetIndex < 0) return
+
+    const target = get().messages[targetIndex]!
 
     // Nothing to answer if the regenerated reply is the first message.
     const preceding = get().messages.slice(0, targetIndex)
@@ -1368,18 +1567,34 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       return
     }
 
-    // Remove the target and everything after it — from the database as well, so
-    // a reload does not resurrect rows that were dropped on screen.
-    const removed = get().messages.slice(targetIndex)
+    /**
+     * Freeze the current answer as a version BEFORE regenerating.
+     *
+     * `generate()` commits its output by APPENDING a message, and its commit
+     * path folds that output into the last assistant turn when that turn
+     * carries a version list (see `generate`). Seeding here is therefore what
+     * preserves the pre-existing answer: it becomes version 1, and the
+     * regenerated text arrives as version 2.
+     *
+     * A message that already has versions keeps every one of them — this only
+     * normalises the index/content pairing, it never discards history.
+     */
+    const seeded = withSwipeIndex({ ...target, swipes: swipesOf(target) }, target.swipeIndex)
+
+    // Remove everything AFTER the target. The target row itself stays, so only
+    // these later messages are dropped from the database.
+    const removed = get().messages.slice(targetIndex + 1)
     for (const message of removed) void deleteMessageRow(message.id)
 
     set((s) => {
       const messages = s.messages.slice(0, targetIndex)
+      messages.push(seeded)
       const conversation = s.activeConversationId
         ? s.conversations.find((c) => c.id === s.activeConversationId)
         : undefined
       // Keep the list counters honest: they were incremented per appended
-      // message, so removing messages must decrement them too.
+      // message, so removing messages must decrement them too. The target is
+      // retained, so only the later messages are subtracted.
       const conversations = conversation
         ? s.conversations.map((c) =>
             c.id === conversation.id
@@ -1400,6 +1615,27 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       }
     })
 
+    // Persist the seeded versions immediately. Without this, a process death
+    // between here and the generation finishing would reload a row whose
+    // `swipes_json` is still empty — losing the exact answer the user just
+    // asked to keep.
+    void saveMessageSwipes(seeded.id, swipesOf(seeded), seeded.swipeIndex)
+
+    /**
+     * Record WHERE the next generation's text must land.
+     *
+     * ⚠️ Inferring this inside `generate` from "the last message has a version
+     * list" does NOT work, and the failure is silent: a reply being regenerated
+     * for the first time has exactly ONE version after seeding, so a
+     * `length > 1` test is false, `generate` appends a sibling, and the user
+     * gets two bubbles for one turn with the version list never growing. The
+     * intent has to be stated explicitly by the code that has it.
+     *
+     * Consumed (and cleared) by `generate`, so a later ordinary turn appends
+     * normally.
+     */
+    pendingSwipeTargetId = seeded.id
+
     // Drop the cached prefix; see the doc comment.
     try {
       await activeEngine()?.resetContext()
@@ -1416,14 +1652,107 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
      * engine store explicitly is the fix, and it is also the more honest
      * expression — regeneration is an engine operation triggered from the chat
      * surface.
+     *
+     * `generate` folds its output into the last assistant message when that
+     * message has a version list, which is how the seeded row above receives
+     * the new version instead of gaining a sibling message.
      */
     await useEngineStore.getState().generate()
+  },
+
+  /**
+   * Show the next / previous version of a reply.
+   *
+   * Both write through `replaceMessage`, so `content`, `swipes`, `swipeIndex`
+   * and the parked transcript copy move together. The invariant
+   * `content === swipes[swipeIndex]` is enforced by `withSwipeIndex`, and the
+   * persist is a single narrow UPDATE, so a process death cannot leave a row
+   * whose text and index disagree.
+   *
+   * A no-op when the message is missing or has one version: the arrows are only
+   * rendered for `swipes.length > 1`, but a screen reader can still reach them,
+   * and rewriting an identical message would emit a pointless DB write per tap.
+   */
+  nextSwipe: (messageId) => {
+    const message = get().messages.find((m) => m.id === messageId)
+    if (!message || swipesOf(message).length <= 1) return
+    const next = stepSwipe(message, 1)
+    get().replaceMessage(next)
+    if (next.content !== message.content) {
+      void saveMessageSwipes(next.id, next.swipes, next.swipeIndex)
+    }
+  },
+
+  prevSwipe: (messageId) => {
+    const message = get().messages.find((m) => m.id === messageId)
+    if (!message || swipesOf(message).length <= 1) return
+    const prev = stepSwipe(message, -1)
+    get().replaceMessage(prev)
+    if (prev.content !== message.content) {
+      void saveMessageSwipes(prev.id, prev.swipes, prev.swipeIndex)
+    }
+  },
+
+  /**
+   * Ask the model for one more version of an existing reply.
+   *
+   * This is the arrow row's "new version" action, and it is the same operation
+   * `regenerateFrom` performs — so it DELEGATES rather than duplicating the
+   * engine reset, the context seeding, and the history trim. Two implementations
+   * of "regenerate" would drift, and the drift would show up as one entry point
+   * silently losing versions the other keeps.
+   *
+   * Refuses a non-assistant message: there is nothing to have alternatives to.
+   */
+  regenerateSwipe: async (messageId) => {
+    const message = get().messages.find((m) => m.id === messageId)
+    if (!message || message.role !== 'assistant') return
+    await get().regenerateFrom(messageId)
   },
 
   setLoadingMore: (loading) => set({ loadingMore: loading }),
   setHasMore: (hasMore) => set({ hasMore }),
 
   setCharacters: (characters) => set({ characters }),
+
+  /**
+   * Add or replace a card, in the store and in SQLite.
+   *
+   * Both halves matter and they must agree. Updating only memory is the bug
+   * this replaces: the card looked imported, survived navigation, and vanished
+   * on the next cold start.
+   */
+  addCharacter: (record) => {
+    set((s) => {
+      // Same id, or the same card name — see the interface note on why the name
+      // has to participate.
+      const kept = s.characters.filter(
+        (c) => c.id !== record.id && c.card?.data?.name !== record.card?.data?.name,
+      )
+      return { characters: [...kept, record] }
+    })
+    // Not awaited: a failed save must not surface in the import flow.
+    void saveCharacterRow(record)
+  },
+
+  /**
+   * Remove a card from the library and from SQLite.
+   *
+   * Conversations that referenced it keep their transcripts and lose only the
+   * link (`ON DELETE SET NULL` in the schema). The store mirrors that here so
+   * the in-memory list does not keep showing a character that no longer exists,
+   * which would leave the next generation building a prompt from a deleted card.
+   */
+  removeCharacter: (id) => {
+    set((s) => ({
+      characters: s.characters.filter((c) => c.id !== id),
+      activeCharacterId: s.activeCharacterId === id ? null : s.activeCharacterId,
+      conversations: s.conversations.map((c) =>
+        c.characterId === id ? { ...c, characterId: null } : c,
+      ),
+    }))
+    void deleteCharacterRow(id)
+  },
 
   /**
    * Selecting a character updates the active conversation too, when there is
@@ -1494,6 +1823,49 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
      */
     const created = get().conversations.find((c) => c.id === id)
     if (created) void saveConversation(created)
+
+    /**
+     * Seed the character's opening line.
+     *
+     * A card's `first_mes` is the scene-setter: the tavern, the greeting, the
+     * character's first move. Without it a roleplay opens on a blank screen and
+     * the user cannot tell whether they are supposed to speak first, while the
+     * model has no anchor for tone.
+     *
+     * Committed as a REAL assistant message rather than injected into the prompt,
+     * so the user can see it, scroll it, edit it and regenerate it like any other
+     * turn.
+     *
+     * `openingMessageFor` returns null for a card with no `first_mes` (or only
+     * whitespace), so a plain conversation still starts empty.
+     */
+    if (selected) {
+      const character = get().characters.find((c) => c.id === selected) ?? null
+      const opening = openingMessageFor(character)
+      if (opening) {
+        /**
+         * Alternate greetings become VERSIONS of the same opening.
+         *
+         * That is exactly what the swipe control is for: a user who dislikes the
+         * first line cycles through the alternatives instead of retyping. The
+         * first greeting is index 0, so the card's primary opening is what shows.
+         */
+        const alternates = alternateOpeningsFor(character)
+        get().appendMessage({
+          id: `opening-${id}`,
+          conversationId: id,
+          role: 'assistant',
+          content: opening,
+          reasoning: null,
+          createdAt: Date.now(),
+          modelId: null,
+          swipeIndex: 0,
+          swipes: alternates.length > 0 ? [opening, ...alternates] : [opening],
+          edited: false,
+          pinned: false,
+        })
+      }
+    }
 
     return id
   },
@@ -1728,8 +2100,35 @@ export async function restorePersistedSettings(): Promise<void> {
       : {}),
     ...(saved.remoteProvider ? { remoteProvider: { ...saved.remoteProvider } } : {}),
     ...(saved.sampling ? { sampling: saved.sampling as never } : {}),
-    ...(saved.contextConfig ? { contextConfig: saved.contextConfig as never } : {}),
+    ...(saved.contextConfig
+      ? { contextConfig: migrateContextConfig(saved.contextConfig as never) }
+      : {}),
   })
+}
+
+/**
+ * Raise a persisted context length that predates the 8192 default.
+ *
+ * A saved `contextLength` OVERRIDES `DEFAULT_CONTEXT_CONFIG`, so simply changing
+ * the default would only affect fresh installs — every existing user would keep
+ * 4096 and never see the fix. That is the classic "we changed the default and
+ * nothing happened" bug.
+ *
+ * Only the OLD DEFAULT (4096) is migrated. A user who deliberately chose 2048 or
+ * 16384 keeps their choice; silently rewriting an explicit preference would be
+ * worse than leaving it alone. 4096 is treated as "never touched" because it was
+ * the shipped value, and anyone who wanted a different number would have moved
+ * it to one of the other steps the Settings slider offers.
+ */
+const LEGACY_DEFAULT_CONTEXT = 4096
+
+function migrateContextConfig(
+  saved: Record<string, unknown> & { contextLength?: number },
+): never {
+  if (saved.contextLength === LEGACY_DEFAULT_CONTEXT) {
+    return { ...saved, contextLength: DEFAULT_CONTEXT_CONFIG.contextLength } as never
+  }
+  return saved as never
 }
 
 /**
@@ -1768,4 +2167,229 @@ export async function restoreConversations(): Promise<void> {
     activeConversationId: null,
     messages: [],
   })
+}
+
+/**
+ * Rebuild the character library from SQLite.
+ *
+ * Call once at boot, before the character screen renders. Before this existed
+ * every imported card lived only in the store, so a cold start began with an
+ * empty library and the user had to re-import their cards -- the same defect
+ * `restoreConversations` above fixed for chat history, and equally invisible
+ * without a real cold start.
+ *
+ * Kept separate from `restoreConversations` rather than folded into it: the two
+ * restore different tables, and a failure loading cards must not prevent
+ * conversations from coming back (or the reverse).
+ *
+ * Failures are non-fatal. With no database `loadCharacters` returns an empty
+ * list and this resolves having changed nothing, which is the correct boot
+ * state for a fresh install.
+ *
+ * `activeCharacterId` is deliberately left alone rather than set to the most
+ * recent card: selecting a character for a conversation is a user decision, and
+ * silently attaching the last-imported character to every new chat would put
+ * words in a character's mouth that the user never chose.
+ */
+export async function restoreCharacters(): Promise<void> {
+  const characters = await loadCharacters()
+  if (characters.length === 0) return
+
+  useChatStore.setState({ characters })
+}
+
+// ---------------------------------------------------------------------------
+// Rolling memory summaries
+// ---------------------------------------------------------------------------
+//
+// ⚠️ EVERYTHING BELOW THIS LINE IS NEW AND APPEND-ONLY.
+//
+// Multiple agents edit this file concurrently. The functions above are owned by
+// other tasks; these two are the whole of task C's store surface. Do not fold
+// them into `generate()` from here — the wiring is the main agent's, and the
+// call sites are named in the comment on `maybeSummarize`.
+
+/**
+ * Cap on the summariser's own output.
+ *
+ * Deliberately larger than `config.maxWords` (200) so the WORDS limit is what
+ * actually stops the summary, not the token cap: a model cut off by the cap
+ * returns a fragment, and `cleanSummary` rejects fragments. Sized for a CJK
+ * summary, where one character is roughly one token.
+ */
+const SUMMARY_MAX_TOKENS = 512
+
+/**
+ * Summarise a conversation's older turns, if it is due.
+ *
+ * ── What problem this solves ────────────────────────────────────────────────
+ * The context window is small (4096 by default). Past roughly 20 exchanges
+ * `trimToContext` starts dropping the OLDEST turns, and those are exactly the
+ * ones holding facts the user stated once — their name, their job, what they
+ * asked for. The user's experience is a character that gradually forgets, with
+ * no error anywhere. SillyTavern's answer is the same one implemented here:
+ * compress old turns into a short summary that stays permanently in the prompt,
+ * so the *amount* of history sent stays bounded while the *information* does
+ * not evaporate.
+ *
+ * ── Why this is not called from `generate()` ────────────────────────────────
+ * Deliberately left as a separate function. A summarisation pass runs its own
+ * `engine.completion`, and the engine owns exactly ONE context (see the
+ * `InferenceEngine` doc) — so calling this while a reply is streaming would
+ * fight the reply. The intended wiring is:
+ *
+ *   1. In `generate()`, AFTER the assistant reply is committed via
+ *      `chat.appendMessage(...)` and the engine status is back to `ready`,
+ *      fire it fire-and-forget:
+ *      `void maybeSummarize(chat.activeConversationId ?? '')`.
+ *      Do NOT await it: the user's reply is already on screen, and blocking
+ *      the turn on a second generation makes the app feel stalled.
+ *   2. For injection, read the memory in `generate()` just before
+ *      `buildSystemPrompt(chat, settings)` and append it as an extra part —
+ *      `getSummaryForPrompt` is async and `buildSystemPrompt` is sync, so the
+ *      await has to happen at the caller. `formatSummaryForPrompt` already
+ *      returns the finished `[摘要] …` form.
+ *
+ * ── Failure policy ──────────────────────────────────────────────────────────
+ * Best-effort and silent, like all persistence here. A failed summary costs the
+ * user nothing until the window fills; a thrown error would break the chat.
+ */
+export async function maybeSummarize(
+  conversationId: string,
+  config: SummarizeConfig = DEFAULT_SUMMARIZE_CONFIG,
+): Promise<void> {
+  if (!conversationId) return
+
+  // ⚠️ Config is a PARAMETER, not a field on `useSettingsStore`.
+  //
+  // Reading it from the settings store would mean adding a field, an
+  // initialiser and a setter to a store that other agents are editing in
+  // parallel, for a knob no UI exposes yet. The default is the shipped
+  // behaviour, and the main agent can add a persisted setting later and pass it
+  // in from the call site without touching this function.
+  if (!config.enabled) return
+
+  // Read the transcript through `getState()` rather than a closed-over
+  // snapshot: this runs fire-and-forget after a turn, and the caller may have
+  // appended the assistant reply in the same tick that started this call.
+  const chat = useChatStore.getState()
+  // The transcript on screen is the right source only while this conversation
+  // IS the active one. For a background conversation we have nothing loaded, so
+  // summarising would compress the wrong turns — worse than not summarising.
+  if (chat.activeConversationId !== conversationId) return
+  const messages = chat.messages
+
+  let previous: StoredSummary | null = null
+  try {
+    previous = await loadSummary(conversationId)
+  } catch {
+    previous = null
+  }
+
+  // How many messages are new since the last pass. Derived from the STORED
+  // COUNT, not from the id: ids are not ordered, and a message deleted from
+  // the middle of the thread would make an id-based count wrong in a way that
+  // silently skips summarisation.
+  const alreadyCovered = previous?.messageCount ?? 0
+  const sinceLast = Math.max(0, messages.length - alreadyCovered)
+
+  const fresh = messages.slice(alreadyCovered)
+  const freshChars = transcriptChars(fresh)
+
+  const due = shouldSummarize({
+    messageCount: messages.length,
+    messagesSinceLastSummary: sinceLast,
+    wordsSinceLastSummary: freshChars,
+    config,
+  })
+  if (!due) return
+
+  // Nothing new to compress would ask the model to "extend" a summary with no
+  // new information, which small models answer by paraphrasing what they were
+  // already given — spending a full generation to make the memory worse.
+  if (fresh.length === 0) return
+
+  const engine = activeEngine()
+  if (!engine || !engine.isReady()) return
+
+  const transcript = buildTranscript(fresh)
+  if (transcript.trim().length === 0) return
+
+  const prompt = buildSummaryPrompt({
+    transcript,
+    previousSummary: previous?.summary ?? null,
+    maxWords: config.maxWords,
+  })
+
+  let raw: string
+  try {
+    const outcome = await engine.completion(
+      prompt,
+      {
+        // Greedy decoding, unlike the roleplay sampler. A creative sample here
+        // would rewrite the very facts it was asked to preserve, and memory
+        // that drifts is worse than memory that is terse.
+        sampling: {
+          ...DEFAULT_SAMPLING,
+          temperature: 0,
+          topK: 1,
+          seed: -1,
+          maxTokens: SUMMARY_MAX_TOKENS,
+        },
+        enableThinking: false,
+        thinkingBudgetTokens: null,
+        jsonSchema: null,
+      },
+      // No streaming: this text is never shown as it is produced, and pushing
+      // it into `streamingText` would render the summariser's inner monologue
+      // in the chat as if the character were speaking.
+      () => {},
+    )
+    raw = outcome.text
+  } catch {
+    // A failed summary must not surface as a chat error. The next turn finds
+    // the same condition still true and tries again.
+    return
+  }
+
+  const cleaned = cleanSummary(raw, { maxWords: config.maxWords, minWords: config.minWords })
+  if (!cleaned.summary) {
+    // Deliberately keeps the previous summary. See `cleanSummary`: a short
+    // reply usually means the model hit its token cap, and replacing a good
+    // summary with a fragment is silent memory destruction.
+    return
+  }
+
+  const now = Date.now()
+  const lastMessage = messages[messages.length - 1]
+  await saveSummary({
+    conversationId,
+    summary: toStoredSummary(cleaned.summary),
+    upToMessageId: lastMessage?.id ?? previous?.upToMessageId ?? '',
+    // The count at the END of this pass, which is what the next pass subtracts.
+    messageCount: messages.length,
+    createdAt: previous?.createdAt ?? now,
+    updatedAt: now,
+  })
+}
+
+/**
+ * The memory block for a conversation, ready to append to the system prompt.
+ *
+ * Returns null when there is no memory yet, so the caller can distinguish
+ * "nothing to say" from "something to say" without inspecting the string.
+ * `formatSummaryForPrompt` would also collapse absent input to `''`, but the
+ * null lets the caller skip the separator join entirely rather than adding a
+ * stray blank section to the prompt.
+ */
+export async function getSummaryForPrompt(conversationId: string): Promise<string | null> {
+  if (!conversationId) return null
+  try {
+    const stored = await loadSummary(conversationId)
+    if (!stored) return null
+    const formatted = formatSummaryForPrompt(stored.summary)
+    return formatted.length > 0 ? formatted : null
+  } catch {
+    return null
+  }
 }

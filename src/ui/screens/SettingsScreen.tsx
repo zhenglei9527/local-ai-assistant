@@ -26,7 +26,23 @@ export function SettingsScreen(): React.JSX.Element {
   const systemPrompt = useSettingsStore((s) => s.systemPrompt)
   const setSystemPrompt = useSettingsStore((s) => s.setSystemPrompt)
 
+  /**
+   * Engine diagnostics, read as FLAT fields.
+   *
+   * These were read as `engineStatus.state`, `.modelId`, `.gpuActive`,
+   * `.activeDevices` and `.gpuFallbackReason` — a nested shape the store has
+   * never had. Every one was `undefined`, so the diagnostics panel showed
+   * "状态: undefined" and "模型: —" no matter what the engine was doing. For the
+   * one screen whose entire job is telling you why the engine is unhappy, that
+   * made it useless.
+   *
+   * TypeScript catches this, but nothing typechecks the build — only tests run.
+   */
   const engineStatus = useEngineStore((s) => s.status)
+  const engineModelId = useEngineStore((s) => s.modelId)
+  const gpuActive = useEngineStore((s) => s.gpuActive)
+  const activeDevices = useEngineStore((s) => s.activeDevices)
+  const gpuFallbackReason = useEngineStore((s) => s.gpuFallbackReason)
   const lastTimings = useEngineStore((s) => s.lastTimings)
 
   const [snapshot, setSnapshot] = useState<MemorySnapshot | null>(null)
@@ -190,18 +206,18 @@ export function SettingsScreen(): React.JSX.Element {
       </Section>
 
       <Section title="引擎诊断">
-        <Diag label="状态" value={engineStatus.state} />
-        <Diag label="模型" value={engineStatus.modelId ?? '—'} />
+        <Diag label="状态" value={engineStatus} />
+        <Diag label="模型" value={engineModelId ?? '—'} />
         <Diag
           label="后端"
           value={
-            engineStatus.gpuActive
-              ? `GPU (${engineStatus.activeDevices.join(', ') || '默认'})`
+            gpuActive
+              ? `GPU (${activeDevices.join(', ') || '默认'})`
               : 'CPU'
           }
         />
-        {engineStatus.gpuFallbackReason ? (
-          <Diag label="GPU 回退原因" value={engineStatus.gpuFallbackReason} />
+        {gpuFallbackReason ? (
+          <Diag label="GPU 回退原因" value={gpuFallbackReason} />
         ) : null}
         {lastTimings ? (
           <>

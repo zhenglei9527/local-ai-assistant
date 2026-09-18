@@ -305,7 +305,19 @@ export function buildPrompt(input: AssembleInput): BuiltPrompt {
 
   // enhanceDefinitions 默认为 disabled，此处恒为空但保留槽位
   sections.set('enhanceDefinitions', '');
-  sections.set('nsfw', DEFAULT_NSFW_PROMPT);
+
+  /**
+   * `nsfw` 段必须过 macro 替换。
+   *
+   * 这里之前直接 `sections.set('nsfw', DEFAULT_NSFW_PROMPT)`，而这个常量本身
+   * 就是 `'{{char}} will not speak for {{user}}.'` —— 没有替换，模型收到的就是
+   * 两个字面量的 `{{char}}` / `{{user}}`。模型无法解释这两个符号，比不发这段
+   * 更糟：它会把注意力引到一堆无意义的括号上。
+   *
+   * 同一函数里 `main`、`charDescription`、`personaDescription` 都走了
+   * `substituteMacros`，只有这一处漏了 —— 典型的"新增槽位时忘了套用统一管线"。
+   */
+  sections.set('nsfw', substituteMacros(DEFAULT_NSFW_PROMPT, macroVars));
 
   sections.set('worldInfoAfter', joinWI(wiAfter));
 

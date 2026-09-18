@@ -25,7 +25,7 @@
  *     and TEXT dates sort correctly only if you never mix formats.
  */
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 export const PRAGMAS: readonly string[] = [
   'PRAGMA journal_mode = WAL;',
@@ -112,6 +112,45 @@ export const CREATE_TABLES: readonly string[] = [
      key   TEXT PRIMARY KEY NOT NULL,
      value TEXT NOT NULL
    );`,
+
+  // One rolling memory summary per conversation.
+  //
+  // ── Why this table exists ───────────────────────────────────────────────
+  // A 4096-token window discards the opening of a conversation after roughly
+  // 20 exchanges, so the model forgets things the user stated outright ("我叫
+  // 小明") and answers as if the chat had just started. Enlarging the window is
+  // not a fix: prefilling more history makes every turn slower, and on a phone
+  // the KV cache for it is memory the model itself needs.
+  //
+  // The SillyTavern answer is to compress the old turns once and keep the
+  // compression in the prompt permanently, which costs a fixed ~200 words
+  // instead of an unbounded transcript.
+  //
+  // ── Shape notes ─────────────────────────────────────────────────────────
+  // `conversation_id` is the PRIMARY KEY rather than a surrogate id: a
+  // conversation has exactly one current summary, and the upsert on this key
+  // is what makes "extend the existing memory" a single statement. A history
+  // table of every past summary would grow without bound and nothing reads it.
+  //
+  // `up_to_message_id` records which message the summary covers *inclusively*.
+  // Without it the summariser cannot tell what is already compressed, and
+  // every pass would re-read the whole transcript — the cost this design is
+  // specifically avoiding. `message_count` is stored alongside it because the
+  // id alone cannot answer "how many messages are new since then"; counting
+  // rows by id ordering would break the moment a message is deleted mid-thread.
+  //
+  // Deliberately NOT stored: the summary's own token count. It is derivable
+  // from the text, and a stored copy would go stale the first time the text is
+  // edited by `cleanSummary`.
+  `CREATE TABLE IF NOT EXISTS summaries (
+     conversation_id  TEXT PRIMARY KEY NOT NULL,
+     summary          TEXT NOT NULL,
+     up_to_message_id TEXT NOT NULL,
+     message_count    INTEGER NOT NULL DEFAULT 0,
+     created_at       INTEGER NOT NULL,
+     updated_at       INTEGER NOT NULL,
+     FOREIGN KEY (conversation_id) REFERENCES conversations (id) ON DELETE CASCADE
+   );`,
 ]
 
 export const CREATE_INDEXES: readonly string[] = [
@@ -129,11 +168,43 @@ export const CREATE_INDEXES: readonly string[] = [
 /**
  * Migration steps, applied in order from the stored user_version.
  *
- * Version 1 is the baseline above, so this list is empty. When version 2
- * arrives, append its statements here — never edit the baseline, because
- * existing installs have already run it.
+ * Version 1 is the baseline above, so its entry is absent. Never edit the
+ * baseline, because existing installs have already run it.
+ *
+ * ── Why version 2 ALSO lives in `CREATE_TABLES` ─────────────────────────────
+ * The `summaries` DDL appears in both places, and that is intentional rather
+ * than an oversight:
+ *
+ *   - `CREATE_TABLES` runs on EVERY launch, for every install. A fresh install
+ *     reaches version 2 without ever executing this migration.
+ *   - `MIGRATIONS[2]` runs exactly once, for an install already sitting at
+ *     version 1.
+ *
+ * Both are `CREATE TABLE IF NOT EXISTS`, so whichever path an install takes,
+ * the second application is a no-op. The alternative — putting the DDL only in
+ * `MIGRATIONS[2]` — works too, but it leaves the baseline DDL array unable to
+ * describe the current schema, so anyone reading `CREATE_TABLES` (or a test
+ * that builds a database from it, as `schema.sql.test.ts` does) sees a schema
+ * that is silently missing a table. Keeping the authoritative DDL in one
+ * readable list and the migration as a thin repeat of it is the smaller lie.
+ *
+ * A statement that is NOT idempotent — an `ALTER TABLE`, a data backfill —
+ * must go in `MIGRATIONS` only, never in `CREATE_TABLES`.
  */
-export const MIGRATIONS: Readonly<Record<number, readonly string[]>> = {}
+export const MIGRATIONS: Readonly<Record<number, readonly string[]>> = {
+  // v1 → v2: rolling conversation memory (see the `summaries` table above).
+  2: [
+    `CREATE TABLE IF NOT EXISTS summaries (
+       conversation_id  TEXT PRIMARY KEY NOT NULL,
+       summary          TEXT NOT NULL,
+       up_to_message_id TEXT NOT NULL,
+       message_count    INTEGER NOT NULL DEFAULT 0,
+       created_at       INTEGER NOT NULL,
+       updated_at       INTEGER NOT NULL,
+       FOREIGN KEY (conversation_id) REFERENCES conversations (id) ON DELETE CASCADE
+     );`,
+  ],
+}
 
 /**
  * Applies pragmas, tables, indexes and any pending migrations.

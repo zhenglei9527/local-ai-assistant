@@ -14,6 +14,7 @@ import {
   useModelStore,
   useSettingsStore,
   restoreConversations,
+  restoreCharacters,
   restorePersistedSettings,
 } from '@/store'
 
@@ -78,6 +79,7 @@ export function AppNavigator(): React.JSX.Element {
       // Conversations BEFORE anything that reads them: the list renders from
       // store state, and restoring later would show an empty screen first.
       await restoreConversations()
+      await restoreCharacters()
       await reconcileFromDisk()
       const wanted = useSettingsStore.getState().lastLoadedModelId
       if (!wanted) return

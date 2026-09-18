@@ -27,6 +27,26 @@ import type { Conversation, Message } from '@/types/domain.ts'
 
 import { getDb } from './connection.ts'
 
+/**
+ * Do NOT reorder this list without reordering the `VALUES (?, ?, …)` binds in
+ * `messageStatement`. The two are checked against each other by eye, not by the
+ * compiler — a column added to the INSERT without a matching value appended
+ * would shift every later `?` by one and happily write garbage.
+ */
+const MESSAGE_BIND_ORDER = [
+  'id',
+  'conversation_id',
+  'role',
+  'content',
+  'reasoning',
+  'model_id',
+  'swipe_index',
+  'swipes_json',
+  'edited',
+  'pinned',
+  'created_at',
+] as const
+
 /** Row shapes as SQLite returns them. */
 interface ConversationRow {
   id: string
@@ -98,6 +118,129 @@ function toMessage(row: MessageRow): Message {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Swipes
+// ---------------------------------------------------------------------------
+
+/**
+ * Make a message's swipe state self-consistent, in place.
+ *
+ * ── The invariant this enforces ─────────────────────────────────────────────
+ * `content === swipes[swipeIndex]`. Both halves are sent to the model and both
+ * are rendered, so a message where they disagree shows one reply on screen and
+ * feeds a different one into the prompt — the model then continues a
+ * conversation the user never had, and nothing on screen explains why.
+ *
+ * ── Why it heals rather than rejects ────────────────────────────────────────
+ * The history on a device predates this feature: every assistant message was
+ * written with `swipes_json = '[]'`, and rows copied over from an older schema
+ * version (or hand-edited during debugging) can carry more swipes than
+ * `swipe_index` addresses. Throwing on those would make a stale database
+ * unopenable — data loss in exchange for tidiness. Healing instead means the
+ * first read of an old message simply records its visible text as version 1,
+ * which is what it always effectively was.
+ *
+ * Three cases, in order:
+ *   1. No swipes stored → seed with the visible content. Migration for free.
+ *   2. Index out of range → clamp to the nearest valid version. A stored index
+ *      past the end is reachable by deleting a swipe on another device.
+ *   3. Content drifted from `swipes[index]` → re-derive from the array.
+ *
+ * Returns nothing: the caller decides whether the healed object is only read or
+ * also written back. `loadMessages` reads; `saveMessage` writes.
+ */
+export function normalizeSwipes(message: Message): void {
+  const swipes = Array.isArray(message.swipes) ? message.swipes : []
+
+  /**
+   * The swipe triple is readonly on the domain `Message` — deliberately, so
+   * that nobody mutates one field in isolation and lets `content` and
+   * `swipes[swipeIndex]` drift apart. `normalizeSwipes` is the single place
+   * entitled to move them together, which is exactly what the readonly type is
+   * meant to force: the exception is visible here instead of scattered.
+   */
+  const mutable = message as {
+    content: string
+    swipes: string[]
+    swipeIndex: number
+  }
+
+  if (swipes.length === 0) {
+    // Heal 1: an assistant message with no versions still has exactly one
+    // version — the text on screen. User/system messages carry no swipes at
+    // all; giving them one would make every user turn render a version
+    // switcher it can never use.
+    mutable.swipes =
+      message.role === 'assistant' && message.content.length > 0 ? [message.content] : []
+    mutable.swipeIndex = 0
+    return
+  }
+
+  // Heal 2: clamp. `Math.trunc` because a fractional index is not addressable
+  // and `swipes[0.5]` is `undefined`, which would silently blank the bubble.
+  const index = Number.isFinite(message.swipeIndex) ? Math.trunc(message.swipeIndex) : 0
+  const clamped = Math.min(Math.max(index, 0), swipes.length - 1)
+  mutable.swipeIndex = clamped
+
+  // Heal 3: the array wins. It is the thing the user navigated through, so the
+  // visible text is the field that drifted.
+  const current = swipes[clamped]
+  if (typeof current === 'string' && current !== message.content) {
+    mutable.content = current
+  }
+}
+
+/** Build the upsert for one message. See `conversationStatement`. */
+function messageStatement(message: Message): [string, unknown[]] {
+  /**
+   * ⚠️ `swipes_json` was a column that nothing ever wrote.
+   *
+   * The schema declared it and `toMessage` read it, but this statement bound
+   * `JSON.stringify(message.swipes ?? [])` — and every message in the app was
+   * constructed with `swipes: []`, so the column was written as `'[]'` on
+   * every single row. Multi-version replies were therefore impossible even
+   * once the UI existed: the store could hold three versions and a reload
+   * would return none of them.
+   *
+   * The bind itself was correct; what was missing was (a) anything ever
+   * populating `swipes`, and (b) a guard that the stored array agrees with
+   * `swipeIndex`. Both are fixed here and in `normalizeSwipes` so that the
+   * column cannot be written in a state the reader would have to distrust.
+   */
+  const swipes = Array.isArray(message.swipes) ? message.swipes : []
+  const swipeIndex =
+    swipes.length > 0
+      ? Math.min(Math.max(Math.trunc(message.swipeIndex) || 0, 0), swipes.length - 1)
+      : 0
+
+  return [
+    `INSERT INTO messages
+       (id, conversation_id, role, content, reasoning, model_id,
+        swipe_index, swipes_json, edited, pinned, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       content = excluded.content,
+       reasoning = excluded.reasoning,
+       swipe_index = excluded.swipe_index,
+       swipes_json = excluded.swipes_json,
+       edited = excluded.edited,
+       pinned = excluded.pinned;`,
+    [
+      message.id,
+      message.conversationId,
+      message.role,
+      message.content,
+      message.reasoning,
+      message.modelId,
+      swipeIndex,
+      JSON.stringify(swipes),
+      message.edited ? 1 : 0,
+      message.pinned ? 1 : 0,
+      message.createdAt,
+    ],
+  ]
+}
+
 /** All conversations, newest activity first. */
 export async function loadConversations(): Promise<Conversation[]> {
   const db = await getDb()
@@ -127,7 +270,14 @@ export async function loadMessages(conversationId: string): Promise<Message[]> {
       'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC;',
       [conversationId],
     )
-    return rows.map(toMessage)
+    // Heal on the way OUT as well as in. A row written before this feature
+    // existed has `swipes_json = '[]'` and a `swipe_index` of 0; returning that
+    // verbatim leaves the UI with a message it can neither switch away from nor
+    // account for. `normalizeSwipes` seeds it from the visible content, so an
+    // upgraded install shows "1/1" rather than a broken 0/0.
+    const messages = rows.map(toMessage)
+    for (const m of messages) normalizeSwipes(m)
+    return messages
   } catch {
     return []
   }
@@ -169,36 +319,6 @@ function conversationStatement(conversation: Conversation): [string, unknown[]] 
       conversation.lastMessageAt,
       conversation.createdAt,
       conversation.updatedAt,
-    ],
-  ]
-}
-
-/** Build the upsert for one message. See `conversationStatement`. */
-function messageStatement(message: Message): [string, unknown[]] {
-  return [
-    `INSERT INTO messages
-       (id, conversation_id, role, content, reasoning, model_id,
-        swipe_index, swipes_json, edited, pinned, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET
-       content = excluded.content,
-       reasoning = excluded.reasoning,
-       swipe_index = excluded.swipe_index,
-       swipes_json = excluded.swipes_json,
-       edited = excluded.edited,
-       pinned = excluded.pinned;`,
-    [
-      message.id,
-      message.conversationId,
-      message.role,
-      message.content,
-      message.reasoning,
-      message.modelId,
-      message.swipeIndex,
-      JSON.stringify(message.swipes ?? []),
-      message.edited ? 1 : 0,
-      message.pinned ? 1 : 0,
-      message.createdAt,
     ],
   ]
 }
@@ -284,5 +404,85 @@ export async function deleteMessage(messageId: string): Promise<void> {
     await db.run('DELETE FROM messages WHERE id = ?;', [messageId])
   } catch {
     /* best effort */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Swipe persistence
+// ---------------------------------------------------------------------------
+
+/**
+ * Load one message's swipe state.
+ *
+ * ── Why this exists ALONGSIDE `loadMessages` ────────────────────────────────
+ * `loadMessages` reads a whole transcript, which is the right thing at boot and
+ * the wrong thing when the user taps a version arrow: it would re-read and
+ * re-allocate every message in the conversation to answer a question about one
+ * of them. As a chat grows, "switch to version 2" would get slower every turn.
+ *
+ * The three columns it selects are exactly the ones that describe swipe state
+ * (`content` is included because the invariant is `content === swipes[index]`
+ * — reading `swipes` without it would make the invariant unverifiable).
+ *
+ * Returns `null` when the message is unknown or persistence is off; the caller
+ * falls back to the in-memory copy rather than treating that as empty, because
+ * "no row" and "no versions" are very different answers.
+ */
+export async function loadMessageSwipes(
+  messageId: string,
+): Promise<{ content: string; swipes: string[]; swipeIndex: number } | null> {
+  const db = await getDb()
+  if (!db) return null
+  try {
+    const row = await db.one<MessageRow>('SELECT * FROM messages WHERE id = ?;', [messageId])
+    if (!row) return null
+    const message = toMessage(row)
+    normalizeSwipes(message)
+    return { content: message.content, swipes: message.swipes, swipeIndex: message.swipeIndex }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Write one message's swipe state.
+ *
+ * Narrower than `saveMessage`, which would also rewrite the role, timestamps and
+ * conversation id of a message that is not changing. A swipe switch touches two
+ * columns, and saying so in the SQL is what keeps a version switch from being
+ * able to clobber anything else — including fields another feature owns (the
+ * `edited` flag, for instance).
+ *
+ * The array is clamped against the index on the way in, mirroring
+ * `messageStatement`, so the row can never be stored in a state `normalizeSwipes`
+ * would have to repair on the next read.
+ */
+export async function saveMessageSwipes(
+  messageId: string,
+  swipes: readonly string[],
+  swipeIndex: number,
+): Promise<void> {
+  const db = await getDb()
+  if (!db) return
+  try {
+    const list = Array.isArray(swipes) ? [...swipes] : []
+    const index =
+      list.length > 0 ? Math.min(Math.max(Math.trunc(swipeIndex) || 0, 0), list.length - 1) : 0
+    /**
+     * `content` is written together with `swipes_json`, in ONE statement.
+     *
+     * Splitting them would create a window — a crash, a kill, a failed second
+     * write — in which the row holds version 3 in `content` and version 1 in
+     * `swipes_json`. On the next launch the user sees the reply they did not
+     * pick, and the text they did pick is gone. One UPDATE makes the invariant
+     * hold across a process death, not just across a successful call.
+     */
+    const content = list.length > 0 ? list[index]! : ''
+    await db.run(
+      `UPDATE messages SET content = ?, swipes_json = ?, swipe_index = ? WHERE id = ?;`,
+      [content, JSON.stringify(list), index, messageId],
+    )
+  } catch {
+    /* best effort — see module docstring */
   }
 }

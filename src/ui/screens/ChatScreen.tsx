@@ -4,6 +4,7 @@ import {
   Clipboard,
   FlatList,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   StyleSheet,
@@ -15,8 +16,13 @@ import {
 import { ScreenScaffold } from '@/ui/ScreenScaffold'
 import { ModelPickerButton } from '@/ui/components/ModelPickerButton'
 import { OFFICIAL_LINE } from '@/data/models/lineCatalog'
+import { activeEngine } from '@/inference/engineFactory'
 import { colors, radii, spacing, typography } from '@/ui/theme'
 import { useChatStore, useEngineStore, useModelStore, useSettingsStore } from '@/store'
+// The version bar's decision logic lives in the store layer rather than inline
+// in JSX so it is reachable from tests — this screen has no renderer under
+// `node --test`.
+import { swipeLabel } from '@/store/swipe'
 import type { Message } from '@/types/domain'
 
 /**
@@ -35,7 +41,23 @@ import type { Message } from '@/types/domain'
  *     during streaming, which is the other common source of jank here.
  */
 export function ChatScreen(): React.JSX.Element {
-  const engineStatus = useEngineStore((s) => s.status)
+  /**
+   * Engine state, read as TWO flat fields.
+   *
+   * This screen used to read `engineStatus.state` and `engineStatus.error`,
+   * but the store has never had that shape — it holds `status` (a bare string)
+   * plus a separate `error` field. Both reads evaluated to `undefined`, so
+   * `isGenerating` was permanently false and the composer never switched to the
+   * Stop button while the model was answering. A user could tap Send repeatedly
+   * mid-generation, queueing duplicate turns.
+   *
+   * It survived review because the failure is silent and the send path still
+   * looks correct; the only visible symptom was a missing Stop button.
+   * TypeScript flags it, but this project typechecks nothing at build time —
+   * only its tests run.
+   */
+  const engineStatusValue = useEngineStore((s) => s.status)
+  const engineError = useEngineStore((s) => s.error)
   const streamingText = useEngineStore((s) => s.streamingText)
   const tokensPerSecond = useEngineStore((s) => s.tokensPerSecond)
   const generate = useEngineStore((s) => s.generate)
@@ -47,10 +69,20 @@ export function ChatScreen(): React.JSX.Element {
   const setActiveConversation = useChatStore((s) => s.setActiveConversation)
   const removeMessage = useChatStore((s) => s.removeMessage)
   const regenerateFrom = useChatStore((s) => s.regenerateFrom)
+  /**
+   * Swipe (multi-version) navigation.
+   *
+   * Read individually rather than destructuring the whole store: a selector that
+   * returned an object would allocate a new one every render and defeat the
+   * `React.memo` on each row, which is the thing keeping the streaming path
+   * smooth (see the module header).
+   */
+  const nextSwipe = useChatStore((s) => s.nextSwipe)
+  const prevSwipe = useChatStore((s) => s.prevSwipe)
 
   const [draft, setDraft] = useState('')
 
-  const isGenerating = engineStatus.state === 'generating'
+  const isGenerating = engineStatusValue === 'generating'
 
   /**
    * Can the user send?
@@ -65,7 +97,7 @@ export function ChatScreen(): React.JSX.Element {
    * the backend is local.
    */
   const backend = useSettingsStore((s) => s.backend)
-  const engineReady = engineStatus.state === 'ready' || engineStatus.state === 'generating'
+  const engineReady = engineStatusValue === 'ready' || engineStatusValue === 'generating'
   const canSend =
     draft.trim().length > 0 && !isGenerating && (backend === 'remote' || readyModelId != null)
 
@@ -88,6 +120,58 @@ export function ChatScreen(): React.JSX.Element {
   const onStop = useCallback(() => {
     void stop()
   }, [stop])
+
+  /**
+   * Open the editor for one message.
+   *
+   * Holds the *whole* message rather than just its id and text: the save path
+   * has to write a full `Message` back (`replaceMessage` takes an object), and
+   * rebuilding one from a stale lookup would be a chance to lose `createdAt`,
+   * `reasoning` or the swipe list.
+   */
+  const [editing, setEditing] = useState<Message | null>(null)
+
+  const openEditor = useCallback((message: Message) => {
+    setEditing(message)
+  }, [])
+
+  const closeEditor = useCallback(() => {
+    setEditing(null)
+  }, [])
+
+  /**
+   * Commit an edit.
+   *
+   * ── Why the context reset is here, not in the store ─────────────────────────
+   * `replaceMessage` swaps one row and stops. That is correct for a store
+   * primitive, but on its own it leaves the engine holding a KV cache built from
+   * the OLD text: the prefix no longer matches the transcript, and a local model
+   * then answers as though the correction never happened — or continues the
+   * replaced text. `src/data/db/schema.ts` states the rule ("the engine must
+   * reset its context after any edit or delete"); `regenerateFrom` already pays
+   * it, and this is the same payment.
+   *
+   * Failure is swallowed deliberately, exactly as `regenerateFrom` does: a
+   * context reset that throws must not cost the user the edit they just made.
+   * The worst case is a slower, slightly stale next turn; blocking the save
+   * would silently discard their typing.
+   */
+  const onSaveEdit = useCallback(
+    (next: string) => {
+      const target = editing
+      if (!target) return
+      setEditing(null)
+      useChatStore.getState().replaceMessage({ ...target, content: next, edited: true })
+      void (async () => {
+        try {
+          await activeEngine()?.resetContext()
+        } catch {
+          // See above — the edit already landed and must survive this.
+        }
+      })()
+    },
+    [editing],
+  )
 
   /**
    * Long-press a message → action sheet.
@@ -129,6 +213,20 @@ export function ChatScreen(): React.JSX.Element {
         })
       }
 
+      /**
+       * Edit, before Delete.
+       *
+       * APPENDED with `push`, never by rewriting the array above: task D adds its
+       * own entry to this same list, and two agents rebuilding the literal would
+       * silently drop one another's item.
+       */
+      actions.push({
+        text: '编辑',
+        onPress: () => {
+          openEditor(message)
+        },
+      })
+
       actions.push({
         text: '删除',
         style: 'destructive',
@@ -150,14 +248,19 @@ export function ChatScreen(): React.JSX.Element {
        */
       Alert.alert('消息操作', undefined, actions)
     },
-    [removeMessage, regenerateFrom],
+    [removeMessage, regenerateFrom, openEditor],
   )
 
   const renderItem = useCallback(
     ({ item }: { item: Message }) => (
-      <MessageBubble message={item} onLongPress={() => onMessageLongPress(item)} />
+      <MessageBubble
+        message={item}
+        onLongPress={() => onMessageLongPress(item)}
+        onPrevSwipe={() => prevSwipe(item.id)}
+        onNextSwipe={() => nextSwipe(item.id)}
+      />
     ),
-    [onMessageLongPress],
+    [onMessageLongPress, prevSwipe, nextSwipe],
   )
 
   /**
@@ -201,13 +304,15 @@ export function ChatScreen(): React.JSX.Element {
   const blockedReason = useMemo(() => {
     // Cloud mode has no local model id by design — never report it as missing.
     if (backend === 'local' && readyModelId == null) return '还没有加载模型'
-    if (engineStatus.state === 'loading') return '模型加载中…'
-    if (engineStatus.state === 'error') return engineStatus.error ?? '引擎出错'
+    if (engineStatusValue === 'loading') return '模型加载中…'
+    if (engineStatusValue === 'error') return engineError ?? '引擎出错'
     return null
-  }, [backend, readyModelId, engineStatus])
+    // Depends on the flat values, not an `engineStatus` object — that binding
+    // no longer exists, and listing it made the memo depend on `undefined`.
+  }, [backend, readyModelId, engineStatusValue, engineError])
 
   const canChat =
-    engineStatus.state !== 'loading' && (backend === 'remote' || readyModelId != null)
+    engineStatusValue !== 'loading' && (backend === 'remote' || readyModelId != null)
 
   // Back to the conversation list. Clearing the active id is the whole
   // mechanism: the navigator shows the list whenever `activeConversationId`
@@ -222,7 +327,7 @@ export function ChatScreen(): React.JSX.Element {
       subtitle={
         backend === 'remote'
           ? '云端 API · 对话内容会发送到第三方'
-          : subtitleFor(engineStatus, readyModelId)
+          : subtitleFor(engineStatusValue, engineError, readyModelId)
       }
       scroll={false}
       headerLeft={
@@ -250,7 +355,7 @@ export function ChatScreen(): React.JSX.Element {
         Rendered ABOVE the transcript so it survives an empty message list —
         which is precisely the case where the user most needs to see it.
       */}
-      {blockedReason && engineStatus.state !== 'generating' ? (
+      {blockedReason && engineStatusValue !== 'generating' ? (
         <View style={styles.errorBanner} accessibilityRole="alert">
           <Text style={styles.errorBannerText}>{blockedReason}</Text>
         </View>
@@ -265,7 +370,7 @@ export function ChatScreen(): React.JSX.Element {
               ? backend === 'remote'
                 ? '在下面输入消息开始聊天。当前使用云端 API，对话内容会发送到第三方。'
                 : '在下面输入消息，开始聊天。所有内容都在本机处理，不会上传。'
-              : engineStatus.state === 'loading'
+              : engineStatusValue === 'loading'
                 ? '正在加载模型，请稍候…'
                 : '还没有可用的模型。请在输入框左侧选择模型，或到「模型」页下载一个。'}
           </Text>
@@ -360,7 +465,112 @@ export function ChatScreen(): React.JSX.Element {
           <ModelPickerButton />
         </View>
       </KeyboardAvoidingView>
+
+      {/*
+        The edit sheet lives at the SCREEN level, outside the KeyboardAvoidingView
+        and the transcript, so typing in it is not re-laid-out by the composer's
+        keyboard handling and so an edit does not re-render the message list.
+      */}
+      {editing ? (
+        <EditMessageModal
+          key={editing.id}
+          initial={editing.content}
+          onCancel={closeEditor}
+          onSave={onSaveEdit}
+        />
+      ) : null}
     </ScreenScaffold>
+  )
+}
+
+/**
+ * Edit one message's text.
+ *
+ * ── Why a Modal and not `Alert.prompt` ──────────────────────────────────────
+ * This is an Android app, and `Alert.prompt` does not exist there — it is an
+ * iOS-only API. Calling it on Android is not a visible crash: React Native
+ * reaches an undefined native method and the press does nothing at all, which is
+ * the worst possible failure for an edit button. A plain `<Modal>` with a
+ * `TextInput` works on both platforms and is the only option that can honour the
+ * dark theme.
+ *
+ * ── Why the draft is copied out of the message ──────────────────────────────
+ * The field is seeded once from `initial` and then owns its text. Writing every
+ * keystroke back into the store would push the transcript through a re-render
+ * per character, and — worse — would persist a half-typed message if the user
+ * backed out.
+ */
+function EditMessageModal({
+  initial,
+  onCancel,
+  onSave,
+}: {
+  initial: string
+  onCancel: () => void
+  onSave: (next: string) => void
+}): React.JSX.Element {
+  const [text, setText] = useState(initial)
+
+  // A message cannot be saved as empty. Whitespace-only content would render as
+  // a blank bubble that the model still receives as a turn.
+  const canSave = text.trim().length > 0
+
+  return (
+    <Modal visible transparent animationType="fade" onRequestClose={onCancel}>
+      {/*
+        Tapping the backdrop cancels, matching the model picker's sheet. The
+        inner Pressable swallows taps so that a mistimed tap inside the sheet
+        does not discard what the user has typed.
+      */}
+      <Pressable style={styles.editBackdrop} onPress={onCancel}>
+        <Pressable style={styles.editSheet} onPress={() => {}}>
+          <View style={styles.editGrabber} />
+          <Text style={styles.editTitle}>编辑消息</Text>
+          <Text style={styles.editHint}>修改后，这条消息之后的对话上下文会重新计算。</Text>
+
+          <TextInput
+            style={styles.editInput}
+            value={text}
+            onChangeText={setText}
+            multiline
+            autoFocus
+            maxLength={8000}
+            textAlignVertical="top"
+            placeholder="输入消息内容…"
+            placeholderTextColor={colors.textFaint}
+          />
+
+          <View style={styles.editActions}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="取消编辑"
+              onPress={onCancel}
+              style={({ pressed }) => [
+                styles.editBtn,
+                styles.editCancel,
+                pressed && styles.pressed,
+              ]}
+            >
+              <Text style={styles.editCancelText}>取消</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="保存修改"
+              onPress={() => onSave(text)}
+              disabled={!canSave}
+              style={({ pressed }) => [
+                styles.editBtn,
+                styles.editSave,
+                !canSave && styles.disabled,
+                pressed && styles.pressed,
+              ]}
+            >
+              <Text style={styles.editSaveText}>保存</Text>
+            </Pressable>
+          </View>
+        </Pressable>
+      </Pressable>
+    </Modal>
   )
 }
 
@@ -375,11 +585,14 @@ export function ChatScreen(): React.JSX.Element {
  * disk whose catalogue entry is missing.
  */
 function subtitleFor(
-  status: { state: string; gpuActive: boolean },
+  status: string,
+  error: string | null,
   modelId: string | null,
 ): string {
+  if (status === 'error') return error ?? '引擎出错'
+  if (status === 'loading') return '模型加载中…'
   if (modelId == null) return '未加载模型'
-  const device = status.gpuActive ? 'GPU' : 'CPU'
+  const device = 'CPU'
   const found = OFFICIAL_LINE.find((m) => m.id === modelId)
   const name = found?.displayName ?? modelId
   return name + ' · ' + device
@@ -390,12 +603,16 @@ function subtitleFor(
  *
  * `React.memo` is load-bearing: without it a streaming tick re-renders every
  * historical message. Props are primitives plus a stable `message` object
- * reference, so the default shallow comparison is sufficient.
+ * reference, so the default shallow comparison is sufficient. The swipe
+ * handlers are `useCallback`-stable in the parent, so adding them does not
+ * break that comparison.
  */
 const MessageBubble = React.memo(function MessageBubble({
   message,
   streaming = false,
   onLongPress,
+  onPrevSwipe,
+  onNextSwipe,
 }: {
   message: Message
   streaming?: boolean
@@ -404,9 +621,25 @@ const MessageBubble = React.memo(function MessageBubble({
    * message and has nothing to act on.
    */
   onLongPress?: () => void
+  /** Switch to the previous/next version of this reply. */
+  onPrevSwipe?: () => void
+  onNextSwipe?: () => void
 }): React.JSX.Element {
   const isUser = message.role === 'user'
   const isSystem = message.role === 'system'
+
+  /**
+   * The version bar's visible state, or null when there is nothing to switch.
+   *
+   * `swipeLabel` owns the decision (hidden below two versions, position always
+   * in range) so the numbers shown here are covered by unit tests — this screen
+   * has no renderer in the test environment, so a fraction computed inline in
+   * JSX would be unverifiable.
+   *
+   * A pre-feature row (or a user turn) yields null, so the bar never renders an
+   * impossible "0/0".
+   */
+  const swipe = streaming ? null : swipeLabel(message)
 
   /**
    * Reasoning is COLLAPSED by default.
@@ -501,6 +734,49 @@ const MessageBubble = React.memo(function MessageBubble({
           </Text>
         ) : null}
       </Pressable>
+
+      {/*
+        Version switcher: ‹ 2/3 ›.
+
+        ── Why it is OUTSIDE the Pressable ───────────────────────────────────
+        The bubble itself is the long-press target. Nested inside it, a tap on an
+        arrow would also register on the parent Pressable, so switching versions
+        would risk opening the action sheet instead — and the two gestures would
+        fight over the same 350ms window. A sibling row keeps the two entirely
+        separate, which is also why the long-press structure above is untouched.
+
+        ── Why hidden below two versions ─────────────────────────────────────
+        One version is the normal case: an ordinary reply has exactly one, and a
+        control reading "1/1" is pure noise on every message in the transcript.
+        The feature should only announce itself when there is somewhere to go.
+      */}
+      {swipe ? (
+        <View style={styles.swipeBar}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="上一个版本"
+            onPress={onPrevSwipe}
+            hitSlop={8}
+            style={({ pressed }) => [styles.swipeArrow, pressed && styles.pressed]}
+          >
+            <Text style={styles.swipeArrowText}>‹</Text>
+          </Pressable>
+
+          <Text style={styles.swipeCount}>
+            {swipe.position}/{swipe.total}
+          </Text>
+
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="下一个版本"
+            onPress={onNextSwipe}
+            hitSlop={8}
+            style={({ pressed }) => [styles.swipeArrow, pressed && styles.pressed]}
+          >
+            <Text style={styles.swipeArrowText}>›</Text>
+          </Pressable>
+        </View>
+      ) : null}
     </View>
   )
 })
@@ -567,6 +843,56 @@ const styles = StyleSheet.create({
   },
   bubbleSystem: { backgroundColor: colors.bubbleSystem },
   bubbleText: { ...typography.message, color: colors.text },
+
+  /**
+   * Version switcher, on its own line under the bubble.
+   *
+   * `alignSelf: 'flex-start'` matches the assistant bubble's own alignment, so
+   * the control lines up with the left edge of the reply it belongs to rather
+   * than floating in the middle of the row.
+   *
+   * The container deliberately does NOT set `flexDirection` alignment to the
+   * row's opposite side: these are assistant-only (a user turn has no
+   * alternatives), so right-aligning them would never apply.
+   */
+  swipeBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: 2,
+    marginTop: 4,
+    marginLeft: 2,
+  },
+  /**
+   * Arrow hit area.
+   *
+   * 28x28 rather than a bare glyph: the ‹ › characters alone are a few pixels
+   * wide, which fails the 44pt touch-target guideline and makes the control feel
+   * broken on a phone. `hitSlop` widens it further without affecting layout.
+   */
+  swipeArrow: {
+    width: 28,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 14,
+    backgroundColor: colors.surfaceRaised,
+  },
+  swipeArrowText: {
+    color: colors.textMuted,
+    fontSize: 17,
+    lineHeight: 20,
+    fontWeight: '400',
+  },
+  /** "2/3" — monospace-ish width so the arrows do not jitter as it changes. */
+  swipeCount: {
+    ...typography.caption,
+    color: colors.textFaint,
+    fontVariant: ['tabular-nums'],
+    paddingHorizontal: 2,
+    minWidth: 30,
+    textAlign: 'center',
+  },
   /**
    * Time inside the bubble, bottom-right.
    *
@@ -695,4 +1021,88 @@ const styles = StyleSheet.create({
   disabled: { opacity: 0.4 },
   pressed: { opacity: 0.75 },
   actionText: { color: '#FFFFFF', fontWeight: '600', fontSize: 15 },
+
+  /**
+   * Edit sheet.
+   *
+   * Same bottom-sheet geometry as the model picker (backdrop → sheet → grabber →
+   * title), because the two are opened from the same screen and a second,
+   * differently-shaped overlay would read as a different app. Pill radii on the
+   * buttons match the composer's 胶囊 controls.
+   */
+  editBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.62)',
+    justifyContent: 'flex-end',
+  },
+  editSheet: {
+    backgroundColor: colors.surface,
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.sm,
+    paddingBottom: spacing.xl,
+    gap: spacing.xs,
+  },
+  editGrabber: {
+    alignSelf: 'center',
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: colors.border,
+    marginBottom: spacing.md,
+  },
+  editTitle: { ...typography.title, fontSize: 19, color: colors.text },
+  /**
+   * Warns that editing invalidates what follows.
+   *
+   * Worth one line: the reply below an edited question was generated from the
+   * OLD wording, and the engine's cached context is dropped on save. Saying so
+   * here is cheaper than a user concluding the app "forgot" the conversation.
+   */
+  editHint: {
+    ...typography.caption,
+    color: colors.textMuted,
+    marginBottom: spacing.md,
+  },
+  /**
+   * Multi-line, ~5 rows tall.
+   *
+   * `minHeight` rather than a fixed height: a one-word correction should not
+   * open a tall empty box, and a paragraph should not be edited through a
+   * two-line slot.
+   */
+  editInput: {
+    minHeight: 120,
+    maxHeight: 240,
+    ...typography.body,
+    color: colors.text,
+    backgroundColor: colors.surfaceRaised,
+    borderRadius: radii.lg,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+  },
+  editActions: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    marginTop: spacing.lg,
+  },
+  editBtn: {
+    flex: 1,
+    minHeight: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.pill,
+  },
+  editCancel: {
+    backgroundColor: colors.surfaceRaised,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+  },
+  editCancelText: { ...typography.body, color: colors.textMuted, fontWeight: '600' },
+  editSave: { backgroundColor: colors.accent },
+  editSaveText: { ...typography.body, color: '#FFFFFF', fontWeight: '600' },
 })

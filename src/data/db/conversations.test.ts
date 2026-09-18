@@ -222,12 +222,24 @@ describe('conversation persistence', () => {
 
   test('a saved message round-trips with every field intact', async () => {
     await saveConversation(conversation())
+    /**
+     * ⚠️ The swipe triple must be SELF-CONSISTENT: `content` has to be
+     * `swipes[swipeIndex]`.
+     *
+     * This fixture previously read `content: '回复内容'`, `swipeIndex: 2`,
+     * `swipes: ['备选一','备选二']` — an index one past the end of the array, and
+     * a `content` matching no element at all. The assertion passed only because
+     * nothing validated the triple, so it was pinning a shape the app can never
+     * legitimately produce. Now that the writer repairs that state, the test
+     * "passed" by round-tripping corrupt data. See the healing test below for
+     * the behaviour that replaced it.
+     */
     const original = message({
       role: 'assistant',
-      content: '回复内容',
+      content: '备选二',
       reasoning: '思考过程',
       modelId: 'qwen2.5-3b',
-      swipeIndex: 2,
+      swipeIndex: 1,
       swipes: ['备选一', '备选二'],
       edited: true,
       pinned: true,
@@ -237,6 +249,54 @@ describe('conversation persistence', () => {
     const [loaded] = await loadMessages('conv_1')
 
     assert.deepEqual(loaded, original)
+  })
+
+  test('an inconsistent swipe triple is repaired on write, not persisted', async () => {
+    // Rows written before swipes existed carry `swipes_json = '[]'` on every
+    // assistant message. Rejecting them would make an existing database
+    // unopenable, so the writer heals instead — and the healed shape is what
+    // must come back out, because `content !== swipes[swipeIndex]` means the
+    // text on screen is not the text sent to the model.
+    await saveConversation(conversation())
+    await saveMessage(
+      message({
+        id: 'msg_bad',
+        role: 'assistant',
+        content: '回复内容',
+        swipeIndex: 2,
+        swipes: ['备选一', '备选二'],
+      }),
+    )
+
+    const loaded = (await loadMessages('conv_1')).find((m) => m.id === 'msg_bad')!
+    assert.equal(loaded.swipeIndex, 1, 'an out-of-range index must be clamped')
+    assert.equal(loaded.content, loaded.swipes[loaded.swipeIndex])
+    assert.equal(loaded.content, '备选二')
+  })
+
+  test('an assistant message with no versions is seeded with its own text', async () => {
+    // Pre-feature rows have `swipes = []`, which renders as a broken "0/0"
+    // counter. Seeding makes them a normal single-version message ("1/1").
+    await saveConversation(conversation())
+    await saveMessage(
+      message({ id: 'msg_legacy', role: 'assistant', content: '旧版本回复', swipes: [] }),
+    )
+
+    const loaded = (await loadMessages('conv_1')).find((m) => m.id === 'msg_legacy')!
+    assert.deepEqual(loaded.swipes, ['旧版本回复'])
+    assert.equal(loaded.swipeIndex, 0)
+    assert.equal(loaded.content, loaded.swipes[loaded.swipeIndex])
+  })
+
+  test('a user message keeps no versions', async () => {
+    // Only assistant turns have alternatives; seeding a user turn would offer
+    // arrows that switch between rewrites of something the user typed.
+    await saveConversation(conversation())
+    await saveMessage(message({ id: 'msg_u', role: 'user', content: '问题', swipes: [] }))
+
+    const loaded = (await loadMessages('conv_1')).find((m) => m.id === 'msg_u')!
+    assert.deepEqual(loaded.swipes, [])
+    assert.equal(loaded.swipeIndex, 0)
   })
 
   test('a transcript survives a full save and reload', async () => {
