@@ -1,10 +1,17 @@
-# 本地 AI 助手
+# 本地 AI 助手 · Local AI Assistant
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Platform: Android](https://img.shields.io/badge/platform-Android-blue.svg)
+![React Native 0.83](https://img.shields.io/badge/React%20Native-0.83-61dafb.svg)
+![llama.cpp / GGUF](https://img.shields.io/badge/inference-llama.cpp%20%2F%20GGUF-orange.svg)
+
+> **English summary:** A fully offline, on-device LLM chat app for Android. Models run on the phone (llama.cpp / GGUF via llama.rn) — conversations never leave the device. Includes a built-in model downloader with resume support and memory-based model recommendation, character cards with world-info, long-term memory summaries, and an optional OpenAI/Anthropic-compatible cloud channel. Chinese-first UI and design docs. MIT licensed.
 
 一个**完全离线**的 Android 大语言模型聊天应用。模型跑在手机上，对话不出设备。
 
 内置模型下载器（含断点续传）、按设备内存自动推荐、角色卡系统，以及一个可选的云端 API 通道。
 
-> **状态：可运行，但未上架。** 核心链路（下载 → 加载 → 对话 → 流式输出）已在真机验证；见文末[已知限制](#已知限制)。
+> **状态：可运行，但未上架。** 核心链路（下载 → 加载 → 对话 → 流式输出）已在真机验证；角色卡持久化、世界书、记忆总结、多版本回复、消息编辑已交付；见文末[已知限制](#已知限制)。
 
 ---
 
@@ -28,6 +35,7 @@
 | **流式输出** | 逐字显示，带实时速度和字数 |
 | **可选云端** | 支持 OpenAI / Anthropic 双协议，低配设备或想用大模型时可切换 |
 | **中文优先** | 界面、错误提示、文档全中文 |
+| **本地持久化** | 会话、角色卡与记忆总结存入 SQLite，重启 App 不丢失 |
 
 ---
 
@@ -144,7 +152,6 @@ src/
 
 诚实列出没做完的部分：
 
-- **会话记录不持久化。** 对话在内存中按会话归档（切走再切回不丢），但**完全重启 App 会丢失**。需要写入 SQLite。
 - **`llama.rn` 是非稳定版**（`0.13.0-rc.3`）。已把对它的依赖限制在一个文件内，升级是单文件修改。
 - **只在小米 14 Pro（骁龙 8 Gen 3 / Android 16）上验证过。** 内存探测逻辑有绝对容差处理（12GB 机型实读约 11.0–11.9 GiB），但未在多机型上校准。
 - **GPU 加速默认关闭。** 骁龙 8 系支持 OpenCL，但开启后无法保存会话状态 —— 二者在 llama.rn 上互斥。
